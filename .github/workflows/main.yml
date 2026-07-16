@@ -29,7 +29,7 @@ jobs:
         shell: bash
 
     env:
-      SOURCE_ZIP: ${{ github.workspace }}/GTAV_Mobile_Runtime_Source_v7.2_final.zip
+      SOURCE_ZIP: ${{ github.workspace }}/GTAV_Mobile_Runtime_Source_v7.2.1_fixed.zip
       BOX64_BUNDLE_ZIP: ${{ github.workspace }}/box64_bundle.zip
       BOX64_BUNDLE_JSON: ${{ github.workspace }}/box64_bundle.json
 
