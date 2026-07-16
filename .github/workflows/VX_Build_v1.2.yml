@@ -1,0 +1,385 @@
+name: Build VX
+
+on:
+  workflow_dispatch:
+    inputs:
+      verbose_logs:
+        description: "Enable verbose Bash tracing"
+        required: false
+        type: boolean
+        default: false
+
+  push:
+    branches:
+      - main
+    paths:
+      - "VX_Source_v1.2.zip"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vx-runtime-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build VX APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      SOURCE_ZIP: ${{ github.workspace }}/VX_Source_v1.2.zip
+      DEBIAN_IMAGE: debian:bookworm-slim
+      VERBOSE_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.verbose_logs && '1' || '0' }}
+      WORKFLOW_REVISION: vx-runtime-selftest-r1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Locate and extract VX source
+        id: source
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          if [[ ! -s "$SOURCE_ZIP" ]]; then
+            echo "ERROR: VX_Source_v1.2.zip was not found or is empty."
+            find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -printf '%P\n' | sort
+            exit 1
+          fi
+
+          unzip -t "$SOURCE_ZIP"
+          SOURCE_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+          EXTRACT_ROOT="$RUNNER_TEMP/vx-runtime-selftest-source"
+          rm -rf "$EXTRACT_ROOT"
+          mkdir -p "$EXTRACT_ROOT"
+          unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_ROOT"
+
+          SETTINGS_FILE="$(find "$EXTRACT_ROOT" -type f -name settings.gradle.kts -print -quit)"
+          [[ -n "$SETTINGS_FILE" && -f "$SETTINGS_FILE" ]] || {
+            echo "ERROR: Android project was not found inside the source ZIP."
+            exit 1
+          }
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          required=(
+            app/build.gradle.kts
+            app/src/main/AndroidManifest.xml
+            app/src/main/assets/vx_bridge_manifest.json
+            app/src/main/java/com/vx/runtime/MainActivity.kt
+            app/src/main/java/com/vx/runtime/RuntimeInstaller.kt
+            app/src/main/java/com/vx/runtime/RuntimeSelfTest.kt
+            SOURCE_MANIFEST.json
+          )
+          for relative in "${required[@]}"; do
+            [[ -s "$PROJECT_DIR/$relative" ]] || {
+              echo "ERROR: Required source file is missing: $relative"
+              exit 1
+            }
+          done
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "source_sha256=$SOURCE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "VX source: $PROJECT_DIR"
+          echo "Source SHA-256: $SOURCE_SHA256"
+
+      - name: Validate source manifest and syntax
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          python3 - "$PROJECT_DIR" <<'PY'
+          from pathlib import Path
+          import hashlib, json, sys, xml.etree.ElementTree as ET
+
+          root = Path(sys.argv[1]).resolve()
+          data = json.loads((root / "SOURCE_MANIFEST.json").read_text(encoding="utf-8"))
+          errors = []
+          for item in data.get("files", []):
+              path = root / item["path"]
+              if not path.is_file():
+                  errors.append(f"missing:{item['path']}")
+                  continue
+              raw = path.read_bytes()
+              if len(raw) != int(item["size_bytes"]):
+                  errors.append(f"size:{item['path']}")
+              if hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                  errors.append(f"sha256:{item['path']}")
+          for xml_file in root.glob("app/src/main/**/*.xml"):
+              ET.parse(xml_file)
+          json.loads((root / "app/src/main/assets/vx_bridge_manifest.json").read_text())
+          if errors:
+              raise SystemExit("Source manifest errors: " + ", ".join(errors))
+          print(f"Source manifest: PASS ({len(data.get('files', []))} files)")
+          PY
+
+          if grep -R -nE 'GTAV_Runtime_Package\.zip|rootfs\.tar\.zst' "$PROJECT_DIR/app/src/main" \
+            --exclude='*.kt' --exclude='README.txt' --exclude='*.xml'; then
+            echo "ERROR: Runtime payload data must not be embedded in the source."
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -Eeuo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+          cache-read-only: false
+
+      - name: Prepare ARM64 glibc bridge
+        id: bridge
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          BRIDGE_ROOT="$RUNNER_TEMP/vx-glibc-bridge"
+          DEST_DIR="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
+          ASSET="$PROJECT_DIR/app/src/main/assets/vx_bridge_manifest.json"
+          LOADER="$BRIDGE_ROOT/libvxld.so"
+          CID=""
+
+          cleanup() {
+            if [[ -n "$CID" ]]; then
+              docker rm -f "$CID" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          rm -rf "$BRIDGE_ROOT"
+          mkdir -p "$BRIDGE_ROOT" "$DEST_DIR"
+          rm -f "$DEST_DIR/libvxld.so"
+
+          docker pull --platform linux/arm64 "$DEBIAN_IMAGE"
+          IMAGE_ID="$(docker image inspect "$DEBIAN_IMAGE" --format '{{.Id}}')"
+          CID="$(docker create --platform linux/arm64 "$DEBIAN_IMAGE" /bin/true)"
+
+          candidates=(
+            /lib/ld-linux-aarch64.so.1
+            /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+            /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+          )
+
+          found=""
+          for candidate in "${candidates[@]}"; do
+            rm -f "$LOADER"
+            if docker cp -L "$CID:$candidate" "$LOADER" >/dev/null 2>&1 && [[ -s "$LOADER" ]]; then
+              found="$candidate"
+              break
+            fi
+          done
+
+          [[ -n "$found" && -s "$LOADER" ]] || {
+            echo "ERROR: ARM64 glibc loader was not found in $DEBIAN_IMAGE"
+            exit 1
+          }
+
+          magic="$(od -An -tx1 -N4 "$LOADER" | tr -d ' \n')"
+          class="$(od -An -tu1 -j4 -N1 "$LOADER" | tr -d ' ')"
+          data="$(od -An -tu1 -j5 -N1 "$LOADER" | tr -d ' ')"
+          machine="$(od -An -tu2 -j18 -N2 "$LOADER" | tr -d ' ')"
+          [[ "$magic" == "7f454c46" && "$class" == "2" && "$data" == "1" && "$machine" == "183" ]] || {
+            echo "ERROR: Extracted glibc loader is not little-endian AArch64 ELF64."
+            exit 1
+          }
+
+          install -m 0755 "$LOADER" "$DEST_DIR/libvxld.so"
+          LOADER_SHA256="$(sha256sum "$DEST_DIR/libvxld.so" | awk '{print $1}')"
+          LOADER_SIZE="$(stat -c '%s' "$DEST_DIR/libvxld.so")"
+
+          jq -n \
+            --arg status READY \
+            --arg app VX \
+            --arg strategy "APK glibc loader -> imported RootFS Box64 -> imported Wine" \
+            --arg debian_suite bookworm \
+            --arg docker_image "$DEBIAN_IMAGE" \
+            --arg docker_image_id "$IMAGE_ID" \
+            --arg source_path "$found" \
+            --arg glibc_loader_sha256 "$LOADER_SHA256" \
+            --argjson glibc_loader_size_bytes "$LOADER_SIZE" \
+            --arg workflow_revision "$WORKFLOW_REVISION" \
+            --arg git_commit "${{ github.sha }}" \
+            '{
+              schema_version: 2,
+              status: $status,
+              app: $app,
+              strategy: $strategy,
+              debian_suite: $debian_suite,
+              docker_image: $docker_image,
+              docker_image_id: $docker_image_id,
+              source_path: $source_path,
+              glibc_loader_sha256: $glibc_loader_sha256,
+              glibc_loader_size_bytes: $glibc_loader_size_bytes,
+              workflow_revision: $workflow_revision,
+              git_commit: $git_commit
+            }' > "$ASSET"
+
+          python3 -m json.tool "$ASSET" >/dev/null
+          file "$DEST_DIR/libvxld.so"
+          readelf -h "$DEST_DIR/libvxld.so" | sed -n '1,25p'
+
+          echo "sha256=$LOADER_SHA256" >> "$GITHUB_OUTPUT"
+          echo "size=$LOADER_SIZE" >> "$GITHUB_OUTPUT"
+          echo "image_id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+          echo "Bridge loader SHA-256: $LOADER_SHA256"
+          trap - EXIT
+          cleanup
+
+      - name: Validate Gradle project
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          gradle projects --no-daemon --stacktrace
+
+      - name: Build VX APK
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          gradle :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all
+
+      - name: Validate standalone APK
+        id: apk
+        run: |
+          set -Eeuo pipefail
+
+          APK_FILE="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -type f -name '*.apk' -print | sort | head -n1)"
+          [[ -s "$APK_FILE" ]] || {
+            echo "ERROR: VX APK was not generated."
+            exit 1
+          }
+
+          BRIDGE_ENTRY="lib/arm64-v8a/libvxld.so"
+          unzip -Z1 "$APK_FILE" | grep -Fxq "$BRIDGE_ENTRY" || {
+            echo "ERROR: $BRIDGE_ENTRY is missing from the APK."
+            exit 1
+          }
+
+          if unzip -Z1 "$APK_FILE" | grep -Ei '(GTAV_Runtime_Package\.zip|rootfs\.tar\.zst|libvxbox64\.so|libbox64\.so)'; then
+            echo "ERROR: VX APK contains a Runtime payload or Box64 binary; it is not standalone/lightweight."
+            exit 1
+          fi
+
+          EMBEDDED="$RUNNER_TEMP/libvxld-from-apk.so"
+          unzip -p "$APK_FILE" "$BRIDGE_ENTRY" > "$EMBEDDED"
+          EMBEDDED_SHA256="$(sha256sum "$EMBEDDED" | awk '{print $1}')"
+          EMBEDDED_SIZE="$(stat -c '%s' "$EMBEDDED")"
+
+          [[ "$EMBEDDED_SHA256" == "${{ steps.bridge.outputs.sha256 }}" ]] || {
+            echo "ERROR: Embedded bridge SHA-256 mismatch."
+            exit 1
+          }
+          [[ "$EMBEDDED_SIZE" == "${{ steps.bridge.outputs.size }}" ]] || {
+            echo "ERROR: Embedded bridge size mismatch."
+            exit 1
+          }
+
+          OUTPUT_DIR="$RUNNER_TEMP/vx-output"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+          cp "$APK_FILE" "$OUTPUT_DIR/VX.apk"
+
+          APK_SHA256="$(sha256sum "$OUTPUT_DIR/VX.apk" | awk '{print $1}')"
+          APK_SIZE="$(stat -c '%s' "$OUTPUT_DIR/VX.apk")"
+          printf '%s  VX.apk\n' "$APK_SHA256" > "$OUTPUT_DIR/VX.apk.sha256"
+          unzip -lv "$OUTPUT_DIR/VX.apk" > "$OUTPUT_DIR/apk-contents.txt"
+
+          jq -n \
+            --arg source_zip_sha256 "${{ steps.source.outputs.source_sha256 }}" \
+            --arg bridge_sha256 "$EMBEDDED_SHA256" \
+            --argjson bridge_size_bytes "$EMBEDDED_SIZE" \
+            --arg bridge_image_id "${{ steps.bridge.outputs.image_id }}" \
+            --arg apk_sha256 "$APK_SHA256" \
+            --argjson apk_size_bytes "$APK_SIZE" \
+            --arg git_commit "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
+            '{
+              app: "VX",
+              architecture: "arm64-v8a",
+              standalone_runtime_import: true,
+              runtime_embedded_in_apk: false,
+              source_zip_sha256: $source_zip_sha256,
+              glibc_bridge_sha256: $bridge_sha256,
+              glibc_bridge_size_bytes: $bridge_size_bytes,
+              glibc_bridge_image_id: $bridge_image_id,
+              apk_sha256: $apk_sha256,
+              apk_size_bytes: $apk_size_bytes,
+              git_commit: $git_commit,
+              run_id: $run_id
+            }' > "$OUTPUT_DIR/build_provenance.json"
+
+          echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
+          echo "sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+          unzip -t "$OUTPUT_DIR/VX.apk"
+          ls -lh "$OUTPUT_DIR"
+
+      - name: Upload VX APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VX-Standalone-${{ github.run_number }}
+          path: |
+            ${{ env.OUTPUT_DIR }}/VX.apk
+            ${{ env.OUTPUT_DIR }}/VX.apk.sha256
+            ${{ env.OUTPUT_DIR }}/build_provenance.json
+            ${{ env.OUTPUT_DIR }}/apk-contents.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VX-Standalone-failure-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/**
+            ${{ env.PROJECT_DIR }}/app/build/outputs/**
+            ${{ env.PROJECT_DIR }}/app/src/main/assets/vx_bridge_manifest.json
+          if-no-files-found: ignore
+          retention-days: 14
+          compression-level: 6
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## VX Standalone build"
+            echo
+            echo "- Status: ${{ job.status }}"
+            echo "- Source SHA-256: ${{ steps.source.outputs.source_sha256 || 'unavailable' }}"
+            echo "- glibc bridge SHA-256: ${{ steps.bridge.outputs.sha256 || 'unavailable' }}"
+            echo "- APK SHA-256: ${{ steps.apk.outputs.sha256 || 'not-generated' }}"
+            echo "- APK size: ${{ steps.apk.outputs.size || 'not-generated' }} bytes"
+            echo "- Runtime embedded: no"
+            echo "- Runtime import after installation: yes"
+          } >> "$GITHUB_STEP_SUMMARY"
