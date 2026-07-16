@@ -1,4 +1,4 @@
-name: Build GTAV Runtime Inspector v7.2.1
+name: Build GTAV Runtime Inspector v7.2
 
 on:
   workflow_dispatch:
@@ -16,12 +16,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: gtav-v7-2-1-${{ github.ref }}
+  group: gtav-v7-2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build v7.2.1 APK
+    name: Build v7.2 APK
     runs-on: ubuntu-22.04
     timeout-minutes: 35
 
@@ -211,8 +211,8 @@ jobs:
             exit 1
           fi
 
-          OUTPUT_DIR="$RUNNER_TEMP/gtav-v7.2.1-output"
-          OUTPUT_APK="$OUTPUT_DIR/GTAV-Runtime-v7.2.1.apk"
+          OUTPUT_DIR="$RUNNER_TEMP/gtav-v7.2-output"
+          OUTPUT_APK="$OUTPUT_DIR/GTAV-Runtime-v7.2.apk"
 
           rm -rf "$OUTPUT_DIR"
           mkdir -p "$OUTPUT_DIR"
@@ -255,13 +255,13 @@ jobs:
           unzip -t "$OUTPUT_APK"
           ls -lh "$OUTPUT_DIR"
 
-      - name: Upload v7.2.1 APK
+      - name: Upload v7.2 APK
         uses: actions/upload-artifact@v4
         with:
-          name: GTAV-Runtime-v7.2.1-${{ github.run_number }}
+          name: GTAV-Runtime-v7.2-${{ github.run_number }}
           path: |
-            ${{ env.OUTPUT_DIR }}/GTAV-Runtime-v7.2.1.apk
-            ${{ env.OUTPUT_DIR }}/GTAV-Runtime-v7.2.1.apk.sha256
+            ${{ env.OUTPUT_DIR }}/GTAV-Runtime-v7.2.apk
+            ${{ env.OUTPUT_DIR }}/GTAV-Runtime-v7.2.apk.sha256
             ${{ env.OUTPUT_DIR }}/build_provenance.json
           if-no-files-found: error
           retention-days: 30
@@ -271,7 +271,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: GTAV-v7.2.1-failure-${{ github.run_number }}
+          name: GTAV-v7.2-failure-${{ github.run_number }}
           path: |
             ${{ env.PROJECT_DIR }}/app/build/reports/**
             ${{ env.PROJECT_DIR }}/app/build/outputs/**
@@ -284,7 +284,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## GTA V Runtime Inspector v7.2.1"
+            echo "## GTA V Runtime Inspector v7.2"
             echo
             echo "- Source ZIP SHA-256: \`${{ steps.inputs.outputs.source_sha256 }}\`"
             echo "- Box64 bundle SHA-256: \`${{ steps.inputs.outputs.bundle_sha256 }}\`"
