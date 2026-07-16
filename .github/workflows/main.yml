@@ -9,6 +9,7 @@ on:
     paths:
       - "GTAV_Mobile_Runtime_Source.zip"
       - "box64_bundle.zip"
+      - "box64_bundle.zip.*"
       - "box64_bundle.json"
       - ".github/workflows/main.yml"
 
@@ -23,7 +24,7 @@ jobs:
   build:
     name: Build GTAV Runtime APK
     runs-on: ubuntu-22.04
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     defaults:
       run:
@@ -35,11 +36,107 @@ jobs:
       BOX64_BUNDLE_JSON: ${{ github.workspace }}/box64_bundle.json
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      # ------------------------------------------------------------
+      # 2. Prepare Box64 bundle
+      #
+      # Supports:
+      #   box64_bundle.zip
+      #
+      # Or:
+      #   box64_bundle.zip.001
+      #   box64_bundle.zip.002
+      #   ...
+      # ------------------------------------------------------------
+
+      - name: Prepare Box64 bundle
+        id: prepare_bundle
+        run: |
+          set -Eeuo pipefail
+
+          echo "Workspace contents:"
+          find "$GITHUB_WORKSPACE" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%P\n' \
+            | sort
+
+          if [[ -f "$BOX64_BUNDLE_ZIP" ]]; then
+            echo "Using complete bundle:"
+            echo "$BOX64_BUNDLE_ZIP"
+
+          else
+            mapfile -t BUNDLE_PARTS < <(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 1 \
+                -type f \
+                -regextype posix-extended \
+                -regex '.*/box64_bundle\.zip\.[0-9]+' \
+                -printf '%p\n' \
+                | sort -V
+            )
+
+            if [[ "${#BUNDLE_PARTS[@]}" -eq 0 ]]; then
+              echo "ERROR: Box64 bundle was not found."
+              echo
+              echo "Expected one of:"
+              echo "  box64_bundle.zip"
+              echo "  box64_bundle.zip.001"
+              echo "  box64_bundle.zip.002"
+              echo "  ..."
+              exit 1
+            fi
+
+            echo "Reassembling multipart Box64 bundle."
+            printf 'Part: %s\n' "${BUNDLE_PARTS[@]}"
+
+            rm -f "$BOX64_BUNDLE_ZIP"
+            : > "$BOX64_BUNDLE_ZIP"
+
+            EXPECTED_NUMBER=1
+
+            for PART in "${BUNDLE_PARTS[@]}"; do
+              EXPECTED_SUFFIX="$(
+                printf '%03d' "$EXPECTED_NUMBER"
+              )"
+
+              ACTUAL_SUFFIX="${PART##*.}"
+
+              if [[ "$ACTUAL_SUFFIX" != "$EXPECTED_SUFFIX" ]]; then
+                echo "ERROR: Missing or incorrectly ordered bundle part."
+                echo "Expected suffix: $EXPECTED_SUFFIX"
+                echo "Found suffix:    $ACTUAL_SUFFIX"
+                echo "File:            $PART"
+                exit 1
+              fi
+
+              echo "Appending $(basename "$PART")"
+              cat "$PART" >> "$BOX64_BUNDLE_ZIP"
+
+              EXPECTED_NUMBER=$((EXPECTED_NUMBER + 1))
+            done
+          fi
+
+          if [[ ! -s "$BOX64_BUNDLE_ZIP" ]]; then
+            echo "ERROR: Prepared Box64 bundle is empty."
+            exit 1
+          fi
+
+          echo "Prepared bundle:"
+          ls -lh "$BOX64_BUNDLE_ZIP"
+
+      # ------------------------------------------------------------
+      # 3. Validate required files and archives
+      # ------------------------------------------------------------
 
       - name: Validate required files
         id: inputs
@@ -52,34 +149,135 @@ jobs:
             "$BOX64_BUNDLE_JSON"
           )
 
-          for file in "${required_files[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "ERROR: Required file is missing: $file"
+          for FILE in "${required_files[@]}"; do
+            if [[ ! -f "$FILE" ]]; then
+              echo "ERROR: Required file is missing:"
+              echo "$FILE"
               echo
               echo "Repository files:"
               find "$GITHUB_WORKSPACE" \
-                -maxdepth 3 \
+                -maxdepth 4 \
                 -type f \
                 -printf '%P\n' \
                 | sort
               exit 1
             fi
+
+            if [[ ! -s "$FILE" ]]; then
+              echo "ERROR: Required file is empty:"
+              echo "$FILE"
+              exit 1
+            fi
           done
 
-          python3 -m json.tool "$BOX64_BUNDLE_JSON" >/dev/null
+          echo "Validating JSON syntax..."
+          python3 -m json.tool \
+            "$BOX64_BUNDLE_JSON" \
+            >/dev/null
+
+          echo "Testing source ZIP..."
           unzip -t "$SOURCE_ZIP"
+
+          echo "Testing Box64 bundle ZIP..."
           unzip -t "$BOX64_BUNDLE_ZIP"
 
-          SOURCE_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
-          BUNDLE_SHA256="$(sha256sum "$BOX64_BUNDLE_ZIP" | awk '{print $1}')"
+          SOURCE_SHA256="$(
+            sha256sum "$SOURCE_ZIP" |
+            awk '{print $1}'
+          )"
 
-          echo "source_sha256=$SOURCE_SHA256" >> "$GITHUB_OUTPUT"
-          echo "bundle_sha256=$BUNDLE_SHA256" >> "$GITHUB_OUTPUT"
+          SOURCE_SIZE="$(
+            stat -c '%s' "$SOURCE_ZIP"
+          )"
+
+          BUNDLE_SHA256="$(
+            sha256sum "$BOX64_BUNDLE_ZIP" |
+            awk '{print $1}'
+          )"
+
+          BUNDLE_SIZE="$(
+            stat -c '%s' "$BOX64_BUNDLE_ZIP"
+          )"
+
+          EXPECTED_BUNDLE_SHA256="$(
+            jq -r '
+              .archive_sha256 //
+              .bundle_sha256 //
+              .zip_sha256 //
+              empty
+            ' "$BOX64_BUNDLE_JSON"
+          )"
+
+          EXPECTED_BUNDLE_SIZE="$(
+            jq -r '
+              .archive_size_bytes //
+              .bundle_size_bytes //
+              .zip_size_bytes //
+              empty
+            ' "$BOX64_BUNDLE_JSON"
+          )"
+
+          if [[ -n "$EXPECTED_BUNDLE_SHA256" ]]; then
+            EXPECTED_BUNDLE_SHA256="$(
+              printf '%s' "$EXPECTED_BUNDLE_SHA256" |
+              tr '[:upper:]' '[:lower:]'
+            )"
+
+            if [[ ! "$EXPECTED_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "ERROR: Invalid bundle SHA-256 in JSON:"
+              echo "$EXPECTED_BUNDLE_SHA256"
+              exit 1
+            fi
+
+            if [[ "$EXPECTED_BUNDLE_SHA256" != "$BUNDLE_SHA256" ]]; then
+              echo "ERROR: Box64 bundle SHA-256 mismatch."
+              echo "Expected: $EXPECTED_BUNDLE_SHA256"
+              echo "Actual:   $BUNDLE_SHA256"
+              exit 1
+            fi
+          else
+            echo "WARNING: Bundle SHA-256 is not present in JSON."
+            echo "The payload itself will still be strictly verified."
+          fi
+
+          if [[ -n "$EXPECTED_BUNDLE_SIZE" ]]; then
+            if [[ ! "$EXPECTED_BUNDLE_SIZE" =~ ^[0-9]+$ ]]; then
+              echo "ERROR: Invalid bundle size in JSON:"
+              echo "$EXPECTED_BUNDLE_SIZE"
+              exit 1
+            fi
+
+            if [[ "$EXPECTED_BUNDLE_SIZE" != "$BUNDLE_SIZE" ]]; then
+              echo "ERROR: Box64 bundle size mismatch."
+              echo "Expected: $EXPECTED_BUNDLE_SIZE"
+              echo "Actual:   $BUNDLE_SIZE"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "source_sha256=$SOURCE_SHA256"
+            echo "source_size=$SOURCE_SIZE"
+            echo "bundle_sha256=$BUNDLE_SHA256"
+            echo "bundle_size=$BUNDLE_SIZE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Input validation: PASS"
+          echo "Source SHA-256: $SOURCE_SHA256"
+          echo "Source size:    $SOURCE_SIZE bytes"
+          echo "Bundle SHA-256: $BUNDLE_SHA256"
+          echo "Bundle size:    $BUNDLE_SIZE bytes"
+          echo
 
           ls -lh \
             "$SOURCE_ZIP" \
             "$BOX64_BUNDLE_ZIP" \
             "$BOX64_BUNDLE_JSON"
+
+      # ------------------------------------------------------------
+      # 4. Extract Android project
+      # ------------------------------------------------------------
 
       - name: Extract Android project
         run: |
@@ -90,18 +288,23 @@ jobs:
           rm -rf "$EXTRACT_ROOT"
           mkdir -p "$EXTRACT_ROOT"
 
-          unzip -q -o "$SOURCE_ZIP" -d "$EXTRACT_ROOT"
+          unzip -q -o \
+            "$SOURCE_ZIP" \
+            -d "$EXTRACT_ROOT"
 
-          SETTINGS_FILE="$(
+          mapfile -t SETTINGS_FILES < <(
             find "$EXTRACT_ROOT" \
               -type f \
-              \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
-              | sort \
-              | head -n 1
-          )"
+              \( \
+                -name "settings.gradle.kts" \
+                -o \
+                -name "settings.gradle" \
+              \) \
+              | sort
+          )
 
-          if [[ -z "$SETTINGS_FILE" || ! -f "$SETTINGS_FILE" ]]; then
-            echo "ERROR: Android project was not found inside $SOURCE_ZIP"
+          if [[ "${#SETTINGS_FILES[@]}" -eq 0 ]]; then
+            echo "ERROR: Android project was not found in source ZIP."
             echo
             echo "Extracted files:"
             find "$EXTRACT_ROOT" \
@@ -112,21 +315,47 @@ jobs:
             exit 1
           fi
 
+          if [[ "${#SETTINGS_FILES[@]}" -gt 1 ]]; then
+            echo "WARNING: Multiple Gradle projects were found:"
+            printf '%s\n' "${SETTINGS_FILES[@]}"
+            echo "The first project will be used."
+          fi
+
+          SETTINGS_FILE="${SETTINGS_FILES[0]}"
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
 
           if [[ ! -f "$PROJECT_DIR/app/build.gradle.kts" &&
                 ! -f "$PROJECT_DIR/app/build.gradle" ]]; then
-            echo "ERROR: Android app module was not found in: $PROJECT_DIR"
+            echo "ERROR: Android app module was not found:"
+            echo "$PROJECT_DIR"
             exit 1
           fi
 
-          if [[ ! -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]]; then
+          if [[ ! -f \
+            "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]]; then
             echo "ERROR: AndroidManifest.xml was not found."
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project: $PROJECT_DIR"
+          {
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "EXTRACT_ROOT=$EXTRACT_ROOT"
+          } >> "$GITHUB_ENV"
+
+          echo "Android project:"
+          echo "$PROJECT_DIR"
+
+          echo
+          echo "Project top-level files:"
+          find "$PROJECT_DIR" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%P\n' \
+            | sort
+
+      # ------------------------------------------------------------
+      # 5. Java
+      # ------------------------------------------------------------
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -143,13 +372,19 @@ jobs:
 
           JAVA_MAJOR="$(
             java -version 2>&1 |
-              sed -n '1s/.*version "\([0-9][0-9]*\).*/\1/p'
+            sed -n \
+              '1s/.*version "\([0-9][0-9]*\).*/\1/p'
           )"
 
-          if [[ -z "$JAVA_MAJOR" || "$JAVA_MAJOR" -lt 17 ]]; then
+          if [[ -z "$JAVA_MAJOR" ||
+                "$JAVA_MAJOR" -lt 17 ]]; then
             echo "ERROR: Java 17 or newer is required."
             exit 1
           fi
+
+      # ------------------------------------------------------------
+      # 6. Android SDK
+      # ------------------------------------------------------------
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -158,18 +393,54 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          yes | sdkmanager --licenses \
+            >/dev/null 2>&1 || true
 
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
+          echo
+          echo "Installed SDK packages:"
+          sdkmanager --list_installed
+
+      # ------------------------------------------------------------
+      # 7. Gradle
+      # ------------------------------------------------------------
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
           cache-read-only: false
+
+      - name: Select Gradle command
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -f "$PROJECT_DIR/gradlew" &&
+                -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" &&
+                -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" ]]; then
+
+            chmod +x "$PROJECT_DIR/gradlew"
+
+            echo "GRADLE_COMMAND=./gradlew" \
+              >> "$GITHUB_ENV"
+
+            echo "Using project Gradle Wrapper."
+
+          else
+            echo "GRADLE_COMMAND=gradle" \
+              >> "$GITHUB_ENV"
+
+            echo "WARNING: Complete Gradle Wrapper was not found."
+            echo "Using Gradle 8.10.2 installed by setup-gradle."
+          fi
+
+      # ------------------------------------------------------------
+      # 8. Extract, verify and inject Box64
+      # ------------------------------------------------------------
 
       - name: Extract, verify, and inject Box64
         id: box64
@@ -183,24 +454,50 @@ jobs:
           rm -rf "$BOX64_TEMP"
           mkdir -p "$BOX64_TEMP" "$DEST_DIR"
 
-          unzip -q -o "$BOX64_BUNDLE_ZIP" -d "$BOX64_TEMP"
+          unzip -q -o \
+            "$BOX64_BUNDLE_ZIP" \
+            -d "$BOX64_TEMP"
 
-          BOX64_SOURCE="$(
+          echo "Box64 bundle contents:"
+          find "$BOX64_TEMP" \
+            -maxdepth 8 \
+            -type f \
+            -printf '%P\n' \
+            | sort
+
+          mapfile -t BOX64_CANDIDATES < <(
             find "$BOX64_TEMP" \
               -type f \
-              \( -name "libbox64.so" -o -name "box64" \) \
-              | sort \
-              | head -n 1
-          )"
+              \( \
+                -name "libbox64.so" \
+                -o \
+                -name "box64" \
+              \) \
+              | sort
+          )
 
-          if [[ -z "$BOX64_SOURCE" || ! -f "$BOX64_SOURCE" ]]; then
-            echo "ERROR: Box64 payload was not found in $BOX64_BUNDLE_ZIP"
-            find "$BOX64_TEMP" -maxdepth 5 -type f -printf '%P\n' | sort
+          if [[ "${#BOX64_CANDIDATES[@]}" -eq 0 ]]; then
+            echo "ERROR: Box64 payload was not found in bundle."
             exit 1
           fi
 
-          ACTUAL_SHA256="$(sha256sum "$BOX64_SOURCE" | awk '{print $1}')"
-          ACTUAL_SIZE="$(stat -c '%s' "$BOX64_SOURCE")"
+          if [[ "${#BOX64_CANDIDATES[@]}" -gt 1 ]]; then
+            echo "ERROR: Multiple Box64 payload candidates found."
+            printf '%s\n' "${BOX64_CANDIDATES[@]}"
+            echo "The bundle must contain exactly one Box64 payload."
+            exit 1
+          fi
+
+          BOX64_SOURCE="${BOX64_CANDIDATES[0]}"
+
+          ACTUAL_SHA256="$(
+            sha256sum "$BOX64_SOURCE" |
+            awk '{print $1}'
+          )"
+
+          ACTUAL_SIZE="$(
+            stat -c '%s' "$BOX64_SOURCE"
+          )"
 
           EXPECTED_SHA256="$(
             jq -r '
@@ -222,62 +519,146 @@ jobs:
             ' "$BOX64_BUNDLE_JSON"
           )"
 
-          if [[ -n "$EXPECTED_SHA256" &&
-                "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]]; then
+          if [[ -z "$EXPECTED_SHA256" ]]; then
+            echo "ERROR: Box64 payload SHA-256 is missing from JSON."
+            exit 1
+          fi
+
+          if [[ -z "$EXPECTED_SIZE" ]]; then
+            echo "ERROR: Box64 payload size is missing from JSON."
+            exit 1
+          fi
+
+          EXPECTED_SHA256="$(
+            printf '%s' "$EXPECTED_SHA256" |
+            tr '[:upper:]' '[:lower:]'
+          )"
+
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Invalid payload SHA-256 in JSON:"
+            echo "$EXPECTED_SHA256"
+            exit 1
+          fi
+
+          if [[ ! "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid payload size in JSON:"
+            echo "$EXPECTED_SIZE"
+            exit 1
+          fi
+
+          if [[ "$EXPECTED_SHA256" != "$ACTUAL_SHA256" ]]; then
             echo "ERROR: Box64 SHA-256 mismatch."
             echo "Expected: $EXPECTED_SHA256"
             echo "Actual:   $ACTUAL_SHA256"
             exit 1
           fi
 
-          if [[ -n "$EXPECTED_SIZE" &&
-                "$EXPECTED_SIZE" != "$ACTUAL_SIZE" ]]; then
+          if [[ "$EXPECTED_SIZE" != "$ACTUAL_SIZE" ]]; then
             echo "ERROR: Box64 size mismatch."
             echo "Expected: $EXPECTED_SIZE"
             echo "Actual:   $ACTUAL_SIZE"
             exit 1
           fi
 
-          ELF_MAGIC="$(od -An -tx1 -N4 "$BOX64_SOURCE" | tr -d ' \n')"
+          # Verify ELF magic.
+          ELF_MAGIC="$(
+            od -An -tx1 -N4 "$BOX64_SOURCE" |
+            tr -d ' \n'
+          )"
+
           if [[ "$ELF_MAGIC" != "7f454c46" ]]; then
             echo "ERROR: Box64 is not an ELF binary."
+            echo "Magic: $ELF_MAGIC"
             exit 1
           fi
 
-          ELF_CLASS="$(od -An -tu1 -j4 -N1 "$BOX64_SOURCE" | tr -d ' ')"
-          ELF_MACHINE="$(od -An -tu2 -j18 -N2 "$BOX64_SOURCE" | tr -d ' ')"
+          # Byte 4: ELF class.
+          # 2 = ELF64.
+          ELF_CLASS="$(
+            od -An -tu1 -j4 -N1 "$BOX64_SOURCE" |
+            tr -d ' '
+          )"
 
           if [[ "$ELF_CLASS" != "2" ]]; then
-            echo "ERROR: Box64 is not ELF64. ELF class: $ELF_CLASS"
+            echo "ERROR: Box64 is not ELF64."
+            echo "ELF class: $ELF_CLASS"
             exit 1
           fi
+
+          # Byte 5: ELF data encoding.
+          # 1 = little endian.
+          ELF_DATA="$(
+            od -An -tu1 -j5 -N1 "$BOX64_SOURCE" |
+            tr -d ' '
+          )"
+
+          if [[ "$ELF_DATA" != "1" ]]; then
+            echo "ERROR: Unsupported ELF byte order."
+            echo "Expected little-endian ELF."
+            echo "ELF data encoding: $ELF_DATA"
+            exit 1
+          fi
+
+          # e_machine begins at offset 18.
+          # 183 = AArch64.
+          ELF_MACHINE="$(
+            od -An -tu2 -j18 -N2 "$BOX64_SOURCE" |
+            tr -d ' '
+          )"
 
           if [[ "$ELF_MACHINE" != "183" ]]; then
-            echo "ERROR: Box64 is not AArch64. e_machine: $ELF_MACHINE"
+            echo "ERROR: Box64 is not AArch64."
+            echo "e_machine: $ELF_MACHINE"
             exit 1
           fi
 
-          install -m 0755 "$BOX64_SOURCE" "$DEST_FILE"
+          install \
+            -m 0755 \
+            "$BOX64_SOURCE" \
+            "$DEST_FILE"
+
           rm -f "$DEST_DIR/README.txt"
 
-          INJECTED_SHA256="$(sha256sum "$DEST_FILE" | awk '{print $1}')"
-          INJECTED_SIZE="$(stat -c '%s' "$DEST_FILE")"
+          INJECTED_SHA256="$(
+            sha256sum "$DEST_FILE" |
+            awk '{print $1}'
+          )"
+
+          INJECTED_SIZE="$(
+            stat -c '%s' "$DEST_FILE"
+          )"
 
           if [[ "$INJECTED_SHA256" != "$ACTUAL_SHA256" ]]; then
-            echo "ERROR: Injected Box64 differs from the verified source."
+            echo "ERROR: Injected Box64 differs from source."
             exit 1
           fi
 
+          if [[ "$INJECTED_SIZE" != "$ACTUAL_SIZE" ]]; then
+            echo "ERROR: Injected Box64 size differs from source."
+            exit 1
+          fi
+
+          echo
+          echo "Injected Box64 information:"
+          ls -lh "$DEST_FILE"
           file "$DEST_FILE"
-          readelf -h "$DEST_FILE" | sed -n '1,25p'
+          readelf -h "$DEST_FILE" | sed -n '1,30p'
 
-          echo "sha256=$INJECTED_SHA256" >> "$GITHUB_OUTPUT"
-          echo "size=$INJECTED_SIZE" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha256=$INJECTED_SHA256"
+            echo "size=$INJECTED_SIZE"
+            echo "path=$DEST_FILE"
+          } >> "$GITHUB_OUTPUT"
 
+          echo
           echo "Box64 injection: PASS"
-          echo "Path: $DEST_FILE"
-          echo "SHA-256: $INJECTED_SHA256"
-          echo "Size: $INJECTED_SIZE bytes"
+          echo "Path:       $DEST_FILE"
+          echo "SHA-256:    $INJECTED_SHA256"
+          echo "Size:       $INJECTED_SIZE bytes"
+
+      # ------------------------------------------------------------
+      # 9. Validate Gradle project
+      # ------------------------------------------------------------
 
       - name: Validate Gradle project
         run: |
@@ -285,9 +666,15 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          gradle projects \
+          "$GRADLE_COMMAND" \
+            projects \
             --no-daemon \
-            --stacktrace
+            --stacktrace \
+            --warning-mode all
+
+      # ------------------------------------------------------------
+      # 10. Build APK
+      # ------------------------------------------------------------
 
       - name: Build APK
         run: |
@@ -295,26 +682,29 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          gradle \
+          "$GRADLE_COMMAND" \
             :app:assembleDebug \
             --no-daemon \
             --stacktrace \
             --warning-mode all
+
+      # ------------------------------------------------------------
+      # 11. Validate generated APK
+      # ------------------------------------------------------------
 
       - name: Validate generated APK
         id: apk
         run: |
           set -Eeuo pipefail
 
-          APK_FILE="$(
+          mapfile -t APK_FILES < <(
             find "$PROJECT_DIR/app/build/outputs/apk/debug" \
               -type f \
               -name "*.apk" \
-              | sort \
-              | head -n 1
-          )"
+              | sort
+          )
 
-          if [[ -z "$APK_FILE" || ! -f "$APK_FILE" ]]; then
+          if [[ "${#APK_FILES[@]}" -eq 0 ]]; then
             echo "ERROR: APK was not generated."
             echo
             echo "Build output:"
@@ -322,42 +712,169 @@ jobs:
               -type f \
               -printf '%P\n' \
               | sort \
-              | sed -n '1,300p'
+              | sed -n '1,400p'
             exit 1
           fi
 
+          if [[ "${#APK_FILES[@]}" -gt 1 ]]; then
+            echo "WARNING: Multiple APK files were generated:"
+            printf '%s\n' "${APK_FILES[@]}"
+          fi
+
+          APK_FILE="${APK_FILES[0]}"
           APK_BOX64_ENTRY="lib/arm64-v8a/libbox64.so"
 
-          if ! unzip -Z1 "$APK_FILE" | grep -Fxq "$APK_BOX64_ENTRY"; then
-            echo "ERROR: $APK_BOX64_ENTRY is missing from the APK."
+          echo "Generated APK:"
+          ls -lh "$APK_FILE"
+
+          unzip -t "$APK_FILE"
+
+          if ! unzip -Z1 "$APK_FILE" |
+               grep -Fxq "$APK_BOX64_ENTRY"; then
+            echo "ERROR: Box64 is missing from APK."
+            echo "Required APK entry:"
+            echo "$APK_BOX64_ENTRY"
             echo
             echo "Native libraries found:"
-            unzip -Z1 "$APK_FILE" | grep '^lib/' || true
+            unzip -Z1 "$APK_FILE" |
+              grep '^lib/' || true
             exit 1
           fi
 
           EMBEDDED_BOX64="$RUNNER_TEMP/libbox64-from-apk.so"
-          unzip -p "$APK_FILE" "$APK_BOX64_ENTRY" > "$EMBEDDED_BOX64"
 
-          EMBEDDED_SHA256="$(sha256sum "$EMBEDDED_BOX64" | awk '{print $1}')"
+          rm -f "$EMBEDDED_BOX64"
 
-          if [[ "$EMBEDDED_SHA256" != "${{ steps.box64.outputs.sha256 }}" ]]; then
+          unzip -p \
+            "$APK_FILE" \
+            "$APK_BOX64_ENTRY" \
+            > "$EMBEDDED_BOX64"
+
+          if [[ ! -s "$EMBEDDED_BOX64" ]]; then
+            echo "ERROR: Extracted Box64 from APK is empty."
+            exit 1
+          fi
+
+          EMBEDDED_SHA256="$(
+            sha256sum "$EMBEDDED_BOX64" |
+            awk '{print $1}'
+          )"
+
+          EMBEDDED_SIZE="$(
+            stat -c '%s' "$EMBEDDED_BOX64"
+          )"
+
+          EXPECTED_EMBEDDED_SHA256="${{ steps.box64.outputs.sha256 }}"
+          EXPECTED_EMBEDDED_SIZE="${{ steps.box64.outputs.size }}"
+
+          if [[ "$EMBEDDED_SHA256" !=
+                "$EXPECTED_EMBEDDED_SHA256" ]]; then
             echo "ERROR: Embedded Box64 SHA-256 mismatch."
-            echo "Expected: ${{ steps.box64.outputs.sha256 }}"
+            echo "Expected: $EXPECTED_EMBEDDED_SHA256"
             echo "Actual:   $EMBEDDED_SHA256"
             exit 1
           fi
 
+          if [[ "$EMBEDDED_SIZE" !=
+                "$EXPECTED_EMBEDDED_SIZE" ]]; then
+            echo "ERROR: Embedded Box64 size mismatch."
+            echo "Expected: $EXPECTED_EMBEDDED_SIZE"
+            echo "Actual:   $EMBEDDED_SIZE"
+            exit 1
+          fi
+
+          EMBEDDED_ELF_MAGIC="$(
+            od -An -tx1 -N4 "$EMBEDDED_BOX64" |
+            tr -d ' \n'
+          )"
+
+          if [[ "$EMBEDDED_ELF_MAGIC" != "7f454c46" ]]; then
+            echo "ERROR: Embedded Box64 is not ELF."
+            exit 1
+          fi
+
+          EMBEDDED_ELF_CLASS="$(
+            od -An -tu1 -j4 -N1 "$EMBEDDED_BOX64" |
+            tr -d ' '
+          )"
+
+          EMBEDDED_ELF_DATA="$(
+            od -An -tu1 -j5 -N1 "$EMBEDDED_BOX64" |
+            tr -d ' '
+          )"
+
+          EMBEDDED_ELF_MACHINE="$(
+            od -An -tu2 -j18 -N2 "$EMBEDDED_BOX64" |
+            tr -d ' '
+          )"
+
+          if [[ "$EMBEDDED_ELF_CLASS" != "2" ]]; then
+            echo "ERROR: Embedded Box64 is not ELF64."
+            exit 1
+          fi
+
+          if [[ "$EMBEDDED_ELF_DATA" != "1" ]]; then
+            echo "ERROR: Embedded Box64 is not little-endian."
+            exit 1
+          fi
+
+          if [[ "$EMBEDDED_ELF_MACHINE" != "183" ]]; then
+            echo "ERROR: Embedded Box64 is not AArch64."
+            echo "e_machine: $EMBEDDED_ELF_MACHINE"
+            exit 1
+          fi
+
+          echo
+          echo "Embedded Box64 verification:"
+          file "$EMBEDDED_BOX64"
+          readelf -h "$EMBEDDED_BOX64" |
+            sed -n '1,30p'
+
+          echo
+          echo "APK compression information:"
+          unzip -lv "$APK_FILE" |
+            grep -F "$APK_BOX64_ENTRY"
+
           OUTPUT_DIR="$RUNNER_TEMP/gtav-runtime-output"
           OUTPUT_APK="$OUTPUT_DIR/GTAV-Runtime.apk"
+          APK_CONTENTS_FILE="$OUTPUT_DIR/apk-contents.txt"
+          BOX64_INFO_FILE="$OUTPUT_DIR/box64-verification.txt"
 
           rm -rf "$OUTPUT_DIR"
           mkdir -p "$OUTPUT_DIR"
 
           cp "$APK_FILE" "$OUTPUT_APK"
 
-          APK_SHA256="$(sha256sum "$OUTPUT_APK" | awk '{print $1}')"
-          APK_SIZE="$(stat -c '%s' "$OUTPUT_APK")"
+          unzip -lv "$OUTPUT_APK" \
+            > "$APK_CONTENTS_FILE"
+
+          {
+            echo "Box64 verification: PASS"
+            echo
+            echo "APK entry: $APK_BOX64_ENTRY"
+            echo "Payload SHA-256: $EMBEDDED_SHA256"
+            echo "Payload size: $EMBEDDED_SIZE bytes"
+            echo "ELF magic: $EMBEDDED_ELF_MAGIC"
+            echo "ELF class: $EMBEDDED_ELF_CLASS"
+            echo "ELF data encoding: $EMBEDDED_ELF_DATA"
+            echo "ELF e_machine: $EMBEDDED_ELF_MACHINE"
+            echo
+            file "$EMBEDDED_BOX64"
+            echo
+            readelf -h "$EMBEDDED_BOX64"
+            echo
+            unzip -lv "$OUTPUT_APK" |
+              grep -F "$APK_BOX64_ENTRY"
+          } > "$BOX64_INFO_FILE"
+
+          APK_SHA256="$(
+            sha256sum "$OUTPUT_APK" |
+            awk '{print $1}'
+          )"
+
+          APK_SIZE="$(
+            stat -c '%s' "$OUTPUT_APK"
+          )"
 
           printf '%s  %s\n' \
             "$APK_SHA256" \
@@ -365,33 +882,93 @@ jobs:
             > "$OUTPUT_APK.sha256"
 
           jq -n \
-            --arg source_zip_sha256 "${{ steps.inputs.outputs.source_sha256 }}" \
-            --arg box64_bundle_sha256 "${{ steps.inputs.outputs.bundle_sha256 }}" \
-            --arg box64_payload_sha256 "${{ steps.box64.outputs.sha256 }}" \
-            --argjson box64_payload_size_bytes "${{ steps.box64.outputs.size }}" \
-            --arg apk_sha256 "$APK_SHA256" \
-            --argjson apk_size_bytes "$APK_SIZE" \
-            --arg git_commit "${{ github.sha }}" \
-            --arg run_id "${{ github.run_id }}" \
-            --arg run_attempt "${{ github.run_attempt }}" \
+            --arg source_zip_sha256 \
+              "${{ steps.inputs.outputs.source_sha256 }}" \
+            --argjson source_zip_size_bytes \
+              "${{ steps.inputs.outputs.source_size }}" \
+            --arg box64_bundle_sha256 \
+              "${{ steps.inputs.outputs.bundle_sha256 }}" \
+            --argjson box64_bundle_size_bytes \
+              "${{ steps.inputs.outputs.bundle_size }}" \
+            --arg box64_payload_sha256 \
+              "${{ steps.box64.outputs.sha256 }}" \
+            --argjson box64_payload_size_bytes \
+              "${{ steps.box64.outputs.size }}" \
+            --arg embedded_box64_sha256 \
+              "$EMBEDDED_SHA256" \
+            --argjson embedded_box64_size_bytes \
+              "$EMBEDDED_SIZE" \
+            --arg apk_sha256 \
+              "$APK_SHA256" \
+            --argjson apk_size_bytes \
+              "$APK_SIZE" \
+            --arg git_commit \
+              "${{ github.sha }}" \
+            --arg git_ref \
+              "${{ github.ref }}" \
+            --arg run_id \
+              "${{ github.run_id }}" \
+            --arg run_number \
+              "${{ github.run_number }}" \
+            --arg run_attempt \
+              "${{ github.run_attempt }}" \
             '{
               source_zip_sha256: $source_zip_sha256,
+              source_zip_size_bytes: $source_zip_size_bytes,
+
               box64_bundle_sha256: $box64_bundle_sha256,
+              box64_bundle_size_bytes: $box64_bundle_size_bytes,
+
               box64_payload_sha256: $box64_payload_sha256,
               box64_payload_size_bytes: $box64_payload_size_bytes,
+
+              embedded_box64_sha256: $embedded_box64_sha256,
+              embedded_box64_size_bytes: $embedded_box64_size_bytes,
+
+              box64_verified_inside_apk:
+                (
+                  $box64_payload_sha256 ==
+                  $embedded_box64_sha256
+                  and
+                  $box64_payload_size_bytes ==
+                  $embedded_box64_size_bytes
+                ),
+
               apk_sha256: $apk_sha256,
               apk_size_bytes: $apk_size_bytes,
+
               git_commit: $git_commit,
+              git_ref: $git_ref,
               run_id: $run_id,
+              run_number: $run_number,
               run_attempt: $run_attempt
             }' > "$OUTPUT_DIR/build_provenance.json"
 
-          echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
-          echo "sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
-          echo "size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+          {
+            echo "OUTPUT_DIR=$OUTPUT_DIR"
+          } >> "$GITHUB_ENV"
 
-          unzip -t "$OUTPUT_APK"
+          {
+            echo "sha256=$APK_SHA256"
+            echo "size=$APK_SIZE"
+            echo "box64_embedded_sha256=$EMBEDDED_SHA256"
+            echo "box64_embedded_size=$EMBEDDED_SIZE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Final output:"
           ls -lh "$OUTPUT_DIR"
+
+          echo
+          echo "APK validation: PASS"
+          echo "APK SHA-256: $APK_SHA256"
+          echo "APK size:    $APK_SIZE bytes"
+          echo "Box64 SHA:   $EMBEDDED_SHA256"
+          echo "Box64 size:  $EMBEDDED_SIZE bytes"
+
+      # ------------------------------------------------------------
+      # 12. Upload final build
+      # ------------------------------------------------------------
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -401,9 +978,15 @@ jobs:
             ${{ env.OUTPUT_DIR }}/GTAV-Runtime.apk
             ${{ env.OUTPUT_DIR }}/GTAV-Runtime.apk.sha256
             ${{ env.OUTPUT_DIR }}/build_provenance.json
+            ${{ env.OUTPUT_DIR }}/box64-verification.txt
+            ${{ env.OUTPUT_DIR }}/apk-contents.txt
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+      # ------------------------------------------------------------
+      # 13. Upload diagnostics if build fails
+      # ------------------------------------------------------------
 
       - name: Upload diagnostics on failure
         if: failure()
@@ -418,15 +1001,44 @@ jobs:
           retention-days: 14
           compression-level: 6
 
+      # ------------------------------------------------------------
+      # 14. GitHub build summary
+      # ------------------------------------------------------------
+
       - name: Build summary
         if: always()
         run: |
           {
             echo "## GTA V Runtime Inspector build"
             echo
+            echo "### Source"
+            echo
             echo "- Source ZIP SHA-256: \`${{ steps.inputs.outputs.source_sha256 || 'unavailable' }}\`"
-            echo "- Box64 bundle SHA-256: \`${{ steps.inputs.outputs.bundle_sha256 || 'unavailable' }}\`"
-            echo "- Box64 payload SHA-256: \`${{ steps.box64.outputs.sha256 || 'not-injected' }}\`"
+            echo "- Source ZIP size: \`${{ steps.inputs.outputs.source_size || 'unavailable' }} bytes\`"
+            echo
+            echo "### Box64 bundle"
+            echo
+            echo "- Bundle SHA-256: \`${{ steps.inputs.outputs.bundle_sha256 || 'unavailable' }}\`"
+            echo "- Bundle size: \`${{ steps.inputs.outputs.bundle_size || 'unavailable' }} bytes\`"
+            echo
+            echo "### Injected Box64"
+            echo
+            echo "- Payload SHA-256: \`${{ steps.box64.outputs.sha256 || 'not-injected' }}\`"
+            echo "- Payload size: \`${{ steps.box64.outputs.size || 'not-injected' }} bytes\`"
+            echo
+            echo "### Box64 inside APK"
+            echo
+            echo "- Embedded SHA-256: \`${{ steps.apk.outputs.box64_embedded_sha256 || 'not-verified' }}\`"
+            echo "- Embedded size: \`${{ steps.apk.outputs.box64_embedded_size || 'not-verified' }} bytes\`"
+            echo
+            echo "### APK"
+            echo
             echo "- APK SHA-256: \`${{ steps.apk.outputs.sha256 || 'not-generated' }}\`"
             echo "- APK size: \`${{ steps.apk.outputs.size || 'not-generated' }} bytes\`"
+            echo
+            if [[ "${{ job.status }}" == "success" ]]; then
+              echo "## ✅ Build and Box64 verification passed"
+            else
+              echo "## ❌ Build or verification failed"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
