@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "tool": "121 Box64 Surgical Extractor",
+  "source_runtime_id": "gtav-redmagic10s-runtime",
+  "source_runtime_version": "0.1.4-experimental",
+  "payload_name": "libbox64.so",
+  "payload_size_bytes": 69535424,
+  "payload_sha256": "b6ffd583c046ad055fc1cbd39cc388f7606f970b54e555e47172c2d3e99fdccd",
+  "archive_size_bytes": 14511235,
+  "archive_sha256": "b4ff3c2c3702d0db6202179378e6e6fa66f220fa0d78d8a072a8039fccb80e4d",
+  "chunk_size_bytes": 25165824,
+  "chunks": [
+    {
+      "index": 1,
+      "name": "box64_bundle.zip",
+      "size_bytes": 14511235,
+      "sha256": "b4ff3c2c3702d0db6202179378e6e6fa66f220fa0d78d8a072a8039fccb80e4d"
+    }
+  ],
+  "reassemble_command": "use box64_bundle.zip directly"
+}
