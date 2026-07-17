@@ -1,0 +1,170 @@
+name: Build GTAV Runtime Manager APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gtav-runtime-manager-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate or extract Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRACT_DIR="$RUNNER_TEMP/gtav-runtime-manager-source"
+          mkdir -p "$EXTRACT_DIR"
+
+          # ابحث أولاً عن مشروع Android مفكوك داخل المستودع.
+          SETTINGS_FILE="$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+              -not -path "*/.git/*" \
+              -not -path "*/.gradle/*" \
+              -not -path "*/build/*" \
+              -print | sort | head -n 1
+          )"
+
+          # إن لم يوجد، فك أول ZIP يحتوي على مشروع Android.
+          if [ -z "${SETTINGS_FILE:-}" ]; then
+            ZIP_FILE="$(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 3 \
+                -type f \
+                -iname "*.zip" \
+                -not -path "*/.git/*" \
+                -print | sort | head -n 1
+            )"
+
+            if [ -z "${ZIP_FILE:-}" ]; then
+              echo "::error::لم يتم العثور على مشروع Android أو ملف ZIP للمصدر."
+              find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -not -path "*/.git/*" | sort
+              exit 1
+            fi
+
+            echo "Extracting: $ZIP_FILE"
+            unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+            SETTINGS_FILE="$(
+              find "$EXTRACT_DIR" \
+                -type f \
+                \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+                -not -path "*/.gradle/*" \
+                -not -path "*/build/*" \
+                -print | sort | head -n 1
+            )"
+          fi
+
+          if [ -z "${SETTINGS_FILE:-}" ]; then
+            echo "::error::لم يتم العثور على settings.gradle.kts أو settings.gradle."
+            find "$EXTRACT_DIR" -maxdepth 7 -type f | sort || true
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::مجلد app غير موجود داخل المشروع: $PROJECT_DIR"
+            find "$PROJECT_DIR" -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/build.gradle.kts" ] && [ ! -f "$PROJECT_DIR/build.gradle" ]; then
+            echo "::error::ملف build.gradle غير موجود داخل: $PROJECT_DIR"
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+          cache-cleanup: on-success
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0"
+
+      - name: Build debug APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace clean :app:assembleDebug
+          else
+            gradle --no-daemon --stacktrace clean :app:assembleDebug
+          fi
+
+      - name: Collect APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.project.outputs.project_dir }}"
+          APK_FILE="$(
+            find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+              -type f \
+              -name "*.apk" \
+              -print | sort | head -n 1
+          )"
+
+          if [ -z "${APK_FILE:-}" ] || [ ! -f "$APK_FILE" ]; then
+            echo "::error::لم يتم العثور على APK بعد البناء."
+            find "$PROJECT_DIR/app/build/outputs" -type f 2>/dev/null | sort || true
+            exit 1
+          fi
+
+          DIST="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DIST"
+
+          OUTPUT_APK="$DIST/GTAV-Runtime-Manager-v1.3.1-debug.apk"
+          cp "$APK_FILE" "$OUTPUT_APK"
+          sha256sum "$OUTPUT_APK" > "$DIST/SHA256SUMS.txt"
+
+          echo "dist_dir=$DIST" >> "$GITHUB_OUTPUT"
+          ls -lh "$DIST"
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTAV-Runtime-Manager-v1.3.1-APK
+          path: ${{ steps.apk.outputs.dist_dir }}/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
