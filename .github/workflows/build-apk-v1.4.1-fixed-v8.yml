@@ -1,0 +1,278 @@
+name: Build GTAV Runtime Manager v1.4.1 APK
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRACT_DIR="$RUNNER_TEMP/gtav-runtime-manager-v141"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          SETTINGS_FILE="$(find "$GITHUB_WORKSPACE" \
+            -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.git/*' \
+            -not -path '*/build/*' \
+            | sort | head -n 1 || true)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            SOURCE_ZIP="$(find "$GITHUB_WORKSPACE" \
+              -maxdepth 6 \
+              -type f \
+              \( -iname '*v1.4.1*.zip' -o -iname '*Advanced*Combined*Source*.zip' \) \
+              | sort | head -n 1 || true)"
+
+            if [ -z "$SOURCE_ZIP" ]; then
+              echo "::error::لم يتم العثور على مشروع Android أو حزمة مصدر v1.4.1."
+              exit 1
+            fi
+
+            unzip -q "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+            SETTINGS_FILE="$(find "$EXTRACT_DIR" \
+              -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              | sort | head -n 1 || true)"
+          fi
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::لم يتم العثور على settings.gradle(.kts)."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::لم يتم العثور على app module داخل المشروع."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept required Android licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/licenses"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+          cache-disabled: true
+
+      - name: Fix incompatible Zstd API call
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET="$PROJECT_DIR/app/src/main/java/com/gtav/runtimemanager/RuntimePreflightChecker.java"
+
+          if [ ! -f "$TARGET" ]; then
+            echo "::error::RuntimePreflightChecker.java was not found."
+            exit 1
+          fi
+
+          python3 - "$TARGET" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          old = "int version = Zstd.versionNumber();"
+          new = "long version = Zstd.compressBound(0L);"
+
+          if old not in text:
+              print("Zstd.versionNumber() call was not present; no replacement needed.")
+          else:
+              text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8")
+              print("Replaced unsupported Zstd.versionNumber() with Zstd.compressBound(0L).")
+          PY
+
+      - name: Validate project
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle \
+            --no-daemon \
+            --console=plain \
+            --stacktrace \
+            projects
+
+      - name: Build debug APK
+        id: build
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          gradle \
+            --no-daemon \
+            --console=plain \
+            --stacktrace \
+            --warning-mode all \
+            clean :app:assembleDebug \
+            2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
+          STATUS=${PIPESTATUS[0]}
+
+          python3 - "$GITHUB_WORKSPACE/gradle-build.log" \
+                    "$GITHUB_WORKSPACE/build-errors.txt" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          source = Path(sys.argv[1])
+          target = Path(sys.argv[2])
+          text = source.read_text(encoding="utf-8", errors="replace")
+          lines = text.splitlines()
+
+          patterns = (
+              r"\berror:",
+              r"cannot find symbol",
+              r"incompatible types",
+              r"has private access",
+              r"no suitable method found",
+              r"package .* does not exist",
+              r"Execution failed for task",
+              r"What went wrong:",
+              r"FAILURE: Build failed",
+          )
+
+          selected = []
+          for index, line in enumerate(lines):
+              if any(re.search(pattern, line, re.IGNORECASE)
+                     for pattern in patterns):
+                  start = max(0, index - 3)
+                  end = min(len(lines), index + 10)
+                  selected.extend(lines[start:end])
+                  selected.append("-" * 80)
+
+          if not selected:
+              selected = lines[-250:]
+
+          target.write_text("\n".join(selected), encoding="utf-8")
+          PY
+
+          {
+            echo "## نتيجة بناء v1.4.1"
+            echo
+            if [ "$STATUS" -eq 0 ]; then
+              echo "✅ اكتمل البناء بنجاح."
+            else
+              echo "❌ فشل البناء. تم حفظ السبب الحقيقي داخل:"
+              echo
+              echo "\`build-errors.txt\` و \`gradle-build.log\`"
+              echo
+              echo "<details><summary>أهم رسائل الخطأ</summary>"
+              echo
+              echo '```text'
+              tail -n 160 "$GITHUB_WORKSPACE/build-errors.txt"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$STATUS"
+
+      - name: Collect and validate APK
+        id: apk
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FILE="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f -name '*.apk' | sort | head -n 1 || true)"
+
+          if [ -z "$APK_FILE" ] || [ ! -f "$APK_FILE" ]; then
+            echo "::error::اكتمل Gradle دون العثور على APK."
+            exit 1
+          fi
+
+          OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          FINAL_APK="$OUTPUT_DIR/GTAV-Runtime-Manager-v1.4.1-debug.apk"
+          cp "$APK_FILE" "$FINAL_APK"
+
+          unzip -Z1 "$FINAL_APK" | sort > "$OUTPUT_DIR/apk-contents.txt"
+          sha256sum "$FINAL_APK" > "$OUTPUT_DIR/SHA256SUMS.txt"
+
+          if grep -Eq '^lib/arm64-v8a/.*zstd.*\.so$' \
+              "$OUTPUT_DIR/apk-contents.txt"; then
+            echo "Native Zstandard library detected."
+          else
+            echo "::warning::لم يتم العثور على libzstd.so داخل APK. سيتم رفع التطبيق لأن هذا تحقق اختياري وليس سبباً لإيقاف البناء."
+          fi
+
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTAV-Runtime-Manager-v1.4.1-APK
+          path: ${{ steps.apk.outputs.output_dir }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTAV-Runtime-Manager-v1.4.1-Build-Diagnostics
+          path: |
+            gradle-build.log
+            build-errors.txt
+            **/app/build/reports/**
+            **/app/build/test-results/**
+            **/app/build/outputs/logs/**
+          if-no-files-found: ignore
+          compression-level: 6
+          retention-days: 14
