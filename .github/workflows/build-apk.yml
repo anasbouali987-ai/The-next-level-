@@ -1,140 +1,110 @@
-name: Build GTAV Runtime Manager APK
+name: Build GTAV Runtime Manager v1.4.1 APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "**/*.java"
+      - "**/*.kt"
+      - "**/*.kts"
+      - "**/*.xml"
+      - "**/*.zip"
+      - ".github/workflows/**"
 
 permissions:
   contents: read
 
+concurrency:
+  group: gtav-runtime-manager-v1-4-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Test and build installable APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.11.1
-
-      - name: Accept SDK licenses
-        run: yes | sdkmanager --licenses >/dev/null || true
-
-      - name: Install Android 36
-        run: |
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;35.0.0"
-
-      - name: Auto-fix project before build
+      - name: Find or extract Android project
+        id: project
         shell: bash
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-          import re
+          set -euo pipefail
 
-          root = Path(".")
+          EXTRACT_DIR="$RUNNER_TEMP/gtav-runtime-manager"
+          mkdir -p "$EXTRACT_DIR"
 
-          # -----------------------------
-          # Remove duplicated permissions
-          # -----------------------------
-          for manifest in root.rglob("AndroidManifest.xml"):
-              txt = manifest.read_text(encoding="utf-8", errors="ignore")
+          SETTINGS_FILE="$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+              -not -path "*/.git/*" \
+              -not -path "*/.gradle/*" \
+              -not -path "*/build/*" \
+              -print | sort | head -n 1
+          )"
 
-              perms = re.findall(r'<uses-permission[^>]+android:name="([^"]+)"[^>]*/>', txt)
+          if [ -z "${SETTINGS_FILE:-}" ]; then
+            ZIP_FILE=""
+            while IFS= read -r candidate; do
+              if unzip -Z1 "$candidate" 2>/dev/null | \
+                   grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then
+                ZIP_FILE="$candidate"
+                break
+              fi
+            done < <(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 4 \
+                -type f \
+                -iname "*.zip" \
+                -not -path "*/.git/*" \
+                -print | sort
+            )
 
-              seen = set()
-              def repl(m):
-                  p = m.group(1)
-                  if p in seen:
-                      return ""
-                  seen.add(p)
-                  return m.group(0)
+            if [ -z "${ZIP_FILE:-}" ]; then
+              echo "::error::Android source project or a ZIP containing settings.gradle was not found."
+              find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -not -path "*/.git/*" | sort
+              exit 1
+            fi
 
-              txt = re.sub(
-                  r'(<uses-permission[^>]+android:name="([^"]+)"[^>]*/>)',
-                  repl,
-                  txt,
-                  flags=re.S
-              )
+            echo "Extracting Android source archive: $ZIP_FILE"
+            unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
 
-              manifest.write_text(txt, encoding="utf-8")
+            SETTINGS_FILE="$(
+              find "$EXTRACT_DIR" \
+                -type f \
+                \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+                -not -path "*/.gradle/*" \
+                -not -path "*/build/*" \
+                -print | sort | head -n 1
+            )"
+          fi
 
-          # ---------------------------------
-          # Java 17 compatibility fixes
-          # ---------------------------------
-          for java in root.rglob("*.java"):
-              txt = java.read_text(encoding="utf-8", errors="ignore")
+          if [ -z "${SETTINGS_FILE:-}" ]; then
+            echo "::error::settings.gradle or settings.gradle.kts was not found."
+            find "$EXTRACT_DIR" -maxdepth 7 -type f | sort || true
+            exit 1
+          fi
 
-              txt = txt.replace(
-                  "Files.readString(",
-                  "new String(Files.readAllBytes("
-              )
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
 
-              txt = txt.replace(
-                  "), StandardCharsets.UTF_8)",
-                  ").toPath()), StandardCharsets.UTF_8)"
-              )
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::The app module was not found in: $PROJECT_DIR"
+            find "$PROJECT_DIR" -maxdepth 4 -type f | sort
+            exit 1
+          fi
 
-              java.write_text(txt, encoding="utf-8")
-          PY
-
-      - name: Grant Gradle permission
-        run: chmod +x gradlew
-
-      - name: Run unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest --stacktrace --warning-mode all
-
-      - name: Build APK
-        run: |
-          ./gradlew \
-            --no-daemon \
-            clean \
-            assembleDebug \
-            --stacktrace \
-            --warning-mode all
-
-      - name: Validate APK
-        run: |
-          APK=$(find . -path "*debug*.apk" | head -n 1)
-
-          test -f "$APK"
-
-          unzip -l "$APK" | grep "lib/arm64-v8a"
-
-          unzip -l "$APK" | grep -i zstd || true
-
-          sha256sum "$APK"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: GTAV-Runtime-Manager-v1.4.1
-          path: |
-            **/*debug*.apk
-
-      - name: Upload diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Build-Diagnostics
-          path: |
-            **/build/reports/**
-            **/build/test-results/**
-            **/build/outputs/logs/**          fi
+          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
+            echo "::error::The app Gradle build file was not found."
+            exit 1
+          fi
 
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
