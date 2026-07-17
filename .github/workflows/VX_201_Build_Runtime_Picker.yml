@@ -1,0 +1,643 @@
+name: Build VX 201 - Unified Verified Final
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "Disable Gradle build cache and rerun all tasks"
+        required: false
+        type: boolean
+        default: false
+      verbose_logs:
+        description: "Enable verbose Bash tracing"
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "VX_201_Merged_Enhanced_Source.zip"
+      - "VX_201_Source.zip"
+      - "VX_201_Merged_Enhanced_Source_Final.zip"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vx-201-unified-final-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_ZIP_PRIMARY: ${{ github.workspace }}/VX_201_Merged_Enhanced_Source.zip
+  SOURCE_ZIP_SECONDARY: ${{ github.workspace }}/VX_201_Merged_Enhanced_Source_Final.zip
+  SOURCE_ZIP_FALLBACK: ${{ github.workspace }}/VX_201_Source.zip
+  VERBOSE_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.verbose_logs && '1' || '0' }}
+  WORKFLOW_REVISION: "vx-201-unified-final-r2"
+  ANDROID_PLATFORM: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  CMAKE_VERSION: "3.22.1"
+  GRADLE_VERSION: "8.10.2"
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    name: Build, sign and deeply verify VX 201
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Locate, test and extract source ZIP
+        id: source
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          SOURCE_ZIP=""
+          for candidate in "$SOURCE_ZIP_PRIMARY" "$SOURCE_ZIP_SECONDARY" "$SOURCE_ZIP_FALLBACK"; do
+            if [[ -f "$candidate" && -s "$candidate" ]]; then
+              SOURCE_ZIP="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$SOURCE_ZIP" ]]; then
+            echo "::error::No supported VX 201 source archive was found or the archives were empty."
+            printf 'Expected: %s\n' \
+              "$(basename "$SOURCE_ZIP_PRIMARY")" \
+              "$(basename "$SOURCE_ZIP_SECONDARY")" \
+              "$(basename "$SOURCE_ZIP_FALLBACK")"
+            echo "Repository root files:"
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+          unzip -t "$SOURCE_ZIP"
+          ZIP_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+          ZIP_SIZE="$(stat -c '%s' "$SOURCE_ZIP")"
+          printf '%s  %s\n' "$ZIP_SHA256" "$(basename "$SOURCE_ZIP")" | tee "$RUNNER_TEMP/source-zip.sha256"
+          echo "SOURCE_ZIP=$SOURCE_ZIP" >> "$GITHUB_ENV"
+          echo "SOURCE_ZIP_SHA256=$ZIP_SHA256" >> "$GITHUB_ENV"
+          echo "SOURCE_ZIP_SIZE=$ZIP_SIZE" >> "$GITHUB_ENV"
+          echo "source_zip=$SOURCE_ZIP" >> "$GITHUB_OUTPUT"
+          echo "zip_sha256=$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+          echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+
+          EXTRACT_DIR="$RUNNER_TEMP/vx201-source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$SOURCE_ZIP" -d "$EXTRACT_DIR"
+
+          mapfile -t ROOT_CANDIDATES < <(
+            find "$EXTRACT_DIR" -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print0 \
+              | xargs -0 -r -n1 dirname \
+              | while IFS= read -r candidate; do
+                  [[ -f "$candidate/app/build.gradle.kts" || -f "$candidate/app/build.gradle" ]] || continue
+                  [[ -f "$candidate/app/src/main/AndroidManifest.xml" ]] || continue
+                  printf '%s\n' "$candidate"
+                done \
+              | sort -u
+          )
+
+          if [[ ${#ROOT_CANDIDATES[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Android project root, found ${#ROOT_CANDIDATES[@]}."
+            printf 'Candidate: %s\n' "${ROOT_CANDIDATES[@]:-<none>}"
+            find "$EXTRACT_DIR" -maxdepth 4 -type f | sort | sed -n '1,200p'
+            exit 1
+          fi
+
+          PROJECT_DIR="${ROOT_CANDIDATES[0]}"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "Detected project root: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 4 -type f | sort | sed -n '1,200p'
+
+      - name: Validate project structure and source contracts
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+          cd "$PROJECT_DIR"
+
+          required_files=(
+            "settings.gradle.kts"
+            "build.gradle.kts"
+            "gradle.properties"
+            "app/build.gradle.kts"
+            "app/src/main/AndroidManifest.xml"
+            "app/src/main/java/com/vx/runtime/MainActivity.java"
+            "app/src/main/java/com/vx/runtime/RuntimeInstaller.kt"
+            "app/src/main/java/com/vx/runtime/RuntimeStore.kt"
+            "app/src/main/java/com/vx/runtime/RuntimeImportBridge.kt"
+            "app/src/main/cpp/CMakeLists.txt"
+            "app/src/main/cpp/vx_diagnostic.cpp"
+            "app/src/main/cpp/native_probe.c"
+            "probes.c"
+          )
+
+          for file in "${required_files[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "::error file=$file::Required project file is missing or empty."
+              exit 1
+            fi
+          done
+
+          grep -Fq 'applicationId = "com.vx.runtime"' app/build.gradle.kts
+          grep -Fq 'versionCode = 202' app/build.gradle.kts
+          grep -Fq 'android:label="VX 201"' app/src/main/AndroidManifest.xml
+          grep -Fq 'add_library(vxdiagnostic SHARED vx_diagnostic.cpp)' app/src/main/cpp/CMakeLists.txt
+          grep -Fq 'nativeRunDiagnostics' app/src/main/cpp/vx_diagnostic.cpp
+          grep -Fq 'pipe2' app/src/main/cpp/vx_diagnostic.cpp
+          grep -Fq 'waitpid' app/src/main/cpp/vx_diagnostic.cpp
+          grep -Fq 'O_CLOEXEC' app/src/main/cpp/vx_diagnostic.cpp
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("app/src/main/java/com/vx/runtime/MainActivity.java").read_text(encoding="utf-8")
+          required = [
+              "System.loadLibrary(\"vxdiagnostic\")",
+              "nativeRunDiagnostics",
+              "FileProvider",
+              "ACTION_OPEN_DOCUMENT",
+              "RuntimeImportBridge.install",
+          ]
+          missing = [item for item in required if item not in source]
+          if missing:
+              raise SystemExit(f"MainActivity.java is missing required contracts: {missing}")
+          print("Java source contract: OK")
+          PY
+
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          for path in [
+              "app/src/main/AndroidManifest.xml",
+              "app/src/main/res/layout/activity_main.xml",
+              "app/src/main/res/values/strings.xml",
+              "app/src/main/res/values/styles.xml",
+              "app/src/main/res/xml/file_paths.xml",
+          ]:
+              ET.parse(path)
+              print(f"XML OK: {path}")
+          PY
+
+          # Host-side syntax check catches ordinary C/C++ errors before downloading Android dependencies.
+          gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only probes.c
+          gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only app/src/main/cpp/native_probe.c
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install pinned Android and cross-compilation tools
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            file \
+            gcc-aarch64-linux-gnu \
+            gcc-x86-64-linux-gnu \
+            libc6-dev-arm64-cross \
+            unzip \
+            zip
+
+          NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          test -x "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          echo "ANDROID_NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+
+          java -version
+          sdkmanager --version
+          "$NDK_ROOT/ndk-build" --version || true
+          cmake --version
+          aarch64-linux-gnu-gcc --version | head -1
+          x86_64-linux-gnu-gcc --version | head -1
+
+      - name: Build and validate all diagnostic probes
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+          cd "$PROJECT_DIR"
+
+          ASSETS_DIR="app/src/main/assets/diagnostic"
+          JNI_DIR="app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$ASSETS_DIR" "$JNI_DIR"
+
+          rm -f \
+            "$ASSETS_DIR/hello_static" \
+            "$ASSETS_DIR/hello_dynamic_glibc" \
+            "$ASSETS_DIR/hello_x86_64" \
+            "$JNI_DIR/libvxnativeprobe.so"
+
+          aarch64-linux-gnu-gcc \
+            -O2 -pipe -static -s \
+            -Wall -Wextra -Werror \
+            -DPROBE_TEXT='"VX201_LINUX_STATIC_OK\\n"' \
+            probes.c \
+            -o "$ASSETS_DIR/hello_static"
+
+          aarch64-linux-gnu-gcc \
+            -O2 -pipe -s \
+            -Wall -Wextra -Werror \
+            -Wl,-z,relro,-z,now \
+            -DPROBE_TEXT='"VX201_GLIBC_DYNAMIC_OK\\n"' \
+            probes.c \
+            -o "$ASSETS_DIR/hello_dynamic_glibc"
+
+          x86_64-linux-gnu-gcc \
+            -O2 -pipe -static -s \
+            -Wall -Wextra -Werror \
+            -DPROBE_TEXT='"VX201_X86_64_OK\\n"' \
+            probes.c \
+            -o "$ASSETS_DIR/hello_x86_64"
+
+          ANDROID_CLANG="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          "$ANDROID_CLANG" \
+            -O2 -fPIE -pie -s \
+            -Wall -Wextra -Werror \
+            -Wl,-z,relro,-z,now \
+            app/src/main/cpp/native_probe.c \
+            -o "$JNI_DIR/libvxnativeprobe.so"
+
+          chmod 0755 \
+            "$ASSETS_DIR/hello_static" \
+            "$ASSETS_DIR/hello_dynamic_glibc" \
+            "$ASSETS_DIR/hello_x86_64" \
+            "$JNI_DIR/libvxnativeprobe.so"
+
+          file \
+            "$ASSETS_DIR/hello_static" \
+            "$ASSETS_DIR/hello_dynamic_glibc" \
+            "$ASSETS_DIR/hello_x86_64" \
+            "$JNI_DIR/libvxnativeprobe.so"
+
+          # Architecture contracts.
+          readelf -h "$ASSETS_DIR/hello_static" | grep -Eq 'Class:[[:space:]]+ELF64'
+          readelf -h "$ASSETS_DIR/hello_static" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          readelf -h "$ASSETS_DIR/hello_dynamic_glibc" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          readelf -h "$ASSETS_DIR/hello_x86_64" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64'
+          readelf -h "$JNI_DIR/libvxnativeprobe.so" | grep -Eq 'Machine:[[:space:]]+AArch64'
+
+          # Static probes must have no PT_INTERP; dynamic glibc probe must have one.
+          if readelf -l "$ASSETS_DIR/hello_static" | grep -q 'Requesting program interpreter'; then
+            echo "::error::ARM64 static probe unexpectedly contains PT_INTERP."
+            exit 1
+          fi
+          if readelf -l "$ASSETS_DIR/hello_x86_64" | grep -q 'Requesting program interpreter'; then
+            echo "::error::x86_64 static probe unexpectedly contains PT_INTERP."
+            exit 1
+          fi
+          readelf -l "$ASSETS_DIR/hello_dynamic_glibc" | grep 'Requesting program interpreter'
+          readelf -l "$JNI_DIR/libvxnativeprobe.so" | grep 'Requesting program interpreter'
+
+          # Verify exact embedded markers before packaging.
+          strings "$ASSETS_DIR/hello_static" | grep -Fx 'VX201_LINUX_STATIC_OK\n'
+          strings "$ASSETS_DIR/hello_dynamic_glibc" | grep -Fx 'VX201_GLIBC_DYNAMIC_OK\n'
+          strings "$ASSETS_DIR/hello_x86_64" | grep -Fx 'VX201_X86_64_OK\n'
+          strings "$JNI_DIR/libvxnativeprobe.so" | grep -F 'VX201_ANDROID_NATIVE_OK'
+
+          sha256sum \
+            "$ASSETS_DIR/hello_static" \
+            "$ASSETS_DIR/hello_dynamic_glibc" \
+            "$ASSETS_DIR/hello_x86_64" \
+            "$JNI_DIR/libvxnativeprobe.so" \
+            | tee "$RUNNER_TEMP/probes.sha256"
+
+          {
+            echo "PROBE_BUILD_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "ANDROID_NDK_VERSION=$ANDROID_NDK_VERSION"
+            echo "ARM64_DYNAMIC_INTERP=$(readelf -l "$ASSETS_DIR/hello_dynamic_glibc" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
+          } > "$ASSETS_DIR/build_metadata.txt"
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-disabled: ${{ inputs.clean_build == true }}
+
+      - name: Validate Gradle model
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+          cd "$PROJECT_DIR"
+
+          gradle --no-daemon --stacktrace projects
+          gradle --no-daemon --stacktrace :app:tasks --all > "$RUNNER_TEMP/gradle-app-tasks.txt"
+          grep -Fq 'assembleDebug' "$RUNNER_TEMP/gradle-app-tasks.txt"
+          grep -Fq 'assembleRelease' "$RUNNER_TEMP/gradle-app-tasks.txt"
+
+      - name: Build debug and release APKs
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+          cd "$PROJECT_DIR"
+
+          CACHE_ARGS=()
+          if [[ "${{ inputs.clean_build }}" == "true" ]]; then
+            CACHE_ARGS+=(--no-build-cache --rerun-tasks)
+          else
+            CACHE_ARGS+=(--build-cache)
+          fi
+
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all \
+            "${CACHE_ARGS[@]}" \
+            :app:assembleDebug \
+            :app:assembleRelease
+
+      - name: Locate APK outputs
+        run: |
+          set -Eeuo pipefail
+
+          DEBUG_APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*-debug.apk' -size +0c | head -1)"
+          RELEASE_APK="$(find "$PROJECT_DIR/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*-release-unsigned.apk' -size +0c | head -1)"
+
+          if [[ -z "$DEBUG_APK" || ! -s "$DEBUG_APK" ]]; then
+            echo "::error::Debug APK was not produced."
+            exit 1
+          fi
+          if [[ -z "$RELEASE_APK" || ! -s "$RELEASE_APK" ]]; then
+            echo "::error::Unsigned release APK was not produced."
+            exit 1
+          fi
+
+          echo "DEBUG_APK=$DEBUG_APK" >> "$GITHUB_ENV"
+          echo "RELEASE_APK=$RELEASE_APK" >> "$GITHUB_ENV"
+          ls -lh "$DEBUG_APK" "$RELEASE_APK"
+
+      - name: Verify APK identity, native libraries and probes
+        run: |
+          set -Eeuo pipefail
+
+          AAPT="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+
+          for apk in "$DEBUG_APK" "$RELEASE_APK"; do
+            echo "===== Verifying $apk ====="
+            unzip -t "$apk"
+
+            BADGING="$($AAPT dump badging "$apk")"
+            printf '%s\n' "$BADGING"
+            grep -Fq "package: name='com.vx.runtime' versionCode='201'" <<< "$BADGING"
+            grep -Fq "application-label:'VX 201'" <<< "$BADGING"
+            grep -Fq "native-code: 'arm64-v8a'" <<< "$BADGING"
+
+            mapfile -t required_entries <<'EOF'
+          assets/diagnostic/hello_static
+          assets/diagnostic/hello_dynamic_glibc
+          assets/diagnostic/hello_x86_64
+          assets/diagnostic/build_metadata.txt
+          lib/arm64-v8a/libvxnativeprobe.so
+          lib/arm64-v8a/libvxdiagnostic.so
+          EOF
+
+            APK_LIST="$(unzip -Z1 "$apk")"
+            for entry in "${required_entries[@]}"; do
+              if ! grep -Fxq "$entry" <<< "$APK_LIST"; then
+                echo "::error file=$apk::Missing required APK entry: $entry"
+                exit 1
+              fi
+            done
+
+            # Extract and verify packaged files, not only source-tree files.
+            APK_EXTRACT="$RUNNER_TEMP/apk-check/$(basename "$apk" .apk)"
+            rm -rf "$APK_EXTRACT"
+            mkdir -p "$APK_EXTRACT"
+            unzip -q "$apk" \
+              'assets/diagnostic/*' \
+              'lib/arm64-v8a/libvxnativeprobe.so' \
+              'lib/arm64-v8a/libvxdiagnostic.so' \
+              -d "$APK_EXTRACT"
+
+            file \
+              "$APK_EXTRACT/assets/diagnostic/hello_static" \
+              "$APK_EXTRACT/assets/diagnostic/hello_dynamic_glibc" \
+              "$APK_EXTRACT/assets/diagnostic/hello_x86_64" \
+              "$APK_EXTRACT/lib/arm64-v8a/libvxnativeprobe.so" \
+              "$APK_EXTRACT/lib/arm64-v8a/libvxdiagnostic.so"
+
+            readelf -h "$APK_EXTRACT/assets/diagnostic/hello_static" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            readelf -h "$APK_EXTRACT/assets/diagnostic/hello_dynamic_glibc" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            readelf -h "$APK_EXTRACT/assets/diagnostic/hello_x86_64" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64'
+            readelf -h "$APK_EXTRACT/lib/arm64-v8a/libvxnativeprobe.so" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            readelf -h "$APK_EXTRACT/lib/arm64-v8a/libvxdiagnostic.so" | grep -Eq 'Machine:[[:space:]]+AArch64'
+
+            sha256sum \
+              "$APK_EXTRACT/assets/diagnostic/hello_static" \
+              "$APK_EXTRACT/assets/diagnostic/hello_dynamic_glibc" \
+              "$APK_EXTRACT/assets/diagnostic/hello_x86_64" \
+              "$APK_EXTRACT/lib/arm64-v8a/libvxnativeprobe.so" \
+              "$APK_EXTRACT/lib/arm64-v8a/libvxdiagnostic.so"
+          done
+
+          # Debug output must already be signed by Gradle's debug certificate.
+          "$APKSIGNER" verify --verbose --print-certs "$DEBUG_APK" \
+            | tee "$RUNNER_TEMP/debug-signature.txt"
+
+          # Release output is intentionally unsigned at this stage.
+          if "$APKSIGNER" verify "$RELEASE_APK" >/dev/null 2>&1; then
+            echo "::warning::Release APK unexpectedly verifies as signed; continuing but recording this fact."
+          else
+            echo "Unsigned release APK confirmed."
+          fi
+
+      - name: Detect optional VX update signing secrets
+        id: signing
+        env:
+          VX_KEYSTORE_BASE64: ${{ secrets.VX_KEYSTORE_BASE64 }}
+          VX_KEYSTORE_PASSWORD: ${{ secrets.VX_KEYSTORE_PASSWORD }}
+          VX_KEY_ALIAS: ${{ secrets.VX_KEY_ALIAS }}
+          VX_KEY_PASSWORD: ${{ secrets.VX_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          missing=0
+          for name in VX_KEYSTORE_BASE64 VX_KEYSTORE_PASSWORD VX_KEY_ALIAS VX_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing optional secret: $name"
+              missing=1
+            fi
+          done
+
+          if [[ $missing -eq 0 ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decode and inspect existing VX signing key
+        if: steps.signing.outputs.available == 'true'
+        env:
+          VX_KEYSTORE_BASE64: ${{ secrets.VX_KEYSTORE_BASE64 }}
+          VX_KEYSTORE_PASSWORD: ${{ secrets.VX_KEYSTORE_PASSWORD }}
+          VX_KEY_ALIAS: ${{ secrets.VX_KEY_ALIAS }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+          umask 077
+
+          KEYSTORE="$RUNNER_TEMP/vx-update.keystore"
+          printf '%s' "$VX_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
+          echo "VX_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+
+          keytool -list -v \
+            -keystore "$KEYSTORE" \
+            -storepass "$VX_KEYSTORE_PASSWORD" \
+            -alias "$VX_KEY_ALIAS" \
+            | sed -E 's/(Keystore password:).*/\1 [REDACTED]/' \
+            | tee "$RUNNER_TEMP/update-key-certificate.txt"
+
+      - name: Zipalign and sign release with the existing VX key
+        if: steps.signing.outputs.available == 'true'
+        env:
+          VX_KEYSTORE_PASSWORD: ${{ secrets.VX_KEYSTORE_PASSWORD }}
+          VX_KEY_ALIAS: ${{ secrets.VX_KEY_ALIAS }}
+          VX_KEY_PASSWORD: ${{ secrets.VX_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/zipalign"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          ALIGNED="$RUNNER_TEMP/VX_201-release-aligned.apk"
+          SIGNED="$RUNNER_TEMP/VX_201-update-signed.apk"
+
+          "$ZIPALIGN" -f -p 4 "$RELEASE_APK" "$ALIGNED"
+          "$ZIPALIGN" -c -v 4 "$ALIGNED"
+
+          "$APKSIGNER" sign \
+            --ks "$VX_KEYSTORE" \
+            --ks-key-alias "$VX_KEY_ALIAS" \
+            --ks-pass "pass:$VX_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$VX_KEY_PASSWORD" \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          "$APKSIGNER" verify --verbose --print-certs "$SIGNED" \
+            | tee "$RUNNER_TEMP/update-signature.txt"
+
+          test -s "$SIGNED"
+          echo "SIGNED_UPDATE_APK=$SIGNED" >> "$GITHUB_ENV"
+
+      - name: Assemble verified artifacts and build report
+        run: |
+          set -Eeuo pipefail
+          [[ "$VERBOSE_LOGS" == "1" ]] && set -x
+
+          OUTPUT="$RUNNER_TEMP/vx201-output"
+          mkdir -p "$OUTPUT"
+
+          cp "$DEBUG_APK" "$OUTPUT/VX_201-debug-signed.apk"
+          cp "$RELEASE_APK" "$OUTPUT/VX_201-release-unsigned.apk"
+          if [[ -n "${SIGNED_UPDATE_APK:-}" && -s "${SIGNED_UPDATE_APK:-}" ]]; then
+            cp "$SIGNED_UPDATE_APK" "$OUTPUT/VX_201-update-signed.apk"
+          fi
+
+          cp "$RUNNER_TEMP/source-zip.sha256" "$OUTPUT/source-zip.sha256"
+          cp "$RUNNER_TEMP/probes.sha256" "$OUTPUT/probes.sha256"
+          cp "$RUNNER_TEMP/debug-signature.txt" "$OUTPUT/debug-signature.txt"
+          [[ -f "$RUNNER_TEMP/update-signature.txt" ]] && cp "$RUNNER_TEMP/update-signature.txt" "$OUTPUT/update-signature.txt"
+          [[ -f "$RUNNER_TEMP/update-key-certificate.txt" ]] && cp "$RUNNER_TEMP/update-key-certificate.txt" "$OUTPUT/update-key-certificate.txt"
+
+          for apk in "$OUTPUT"/*.apk; do
+            sha256sum "$apk" > "$apk.sha256"
+          done
+
+          AAPT="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt"
+          {
+            echo "VX 201 UNIFIED VERIFIED BUILD REPORT"
+            echo "============================"
+            echo "Build UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Workflow revision: $WORKFLOW_REVISION"
+            echo "Source ZIP: $(basename "$SOURCE_ZIP")"
+            echo "Source ZIP SHA-256: $SOURCE_ZIP_SHA256"
+            echo "Source ZIP size: $SOURCE_ZIP_SIZE bytes"
+            echo "Project root: $PROJECT_DIR"
+            echo "Java: $JAVA_VERSION"
+            echo "Gradle: $GRADLE_VERSION"
+            echo "Android platform: $ANDROID_PLATFORM"
+            echo "Build tools: $ANDROID_BUILD_TOOLS"
+            echo "NDK: $ANDROID_NDK_VERSION"
+            echo "CMake: $CMAKE_VERSION"
+            echo
+            echo "Signing status:"
+            echo "- Debug APK: signed automatically with Gradle debug key"
+            if [[ -f "$OUTPUT/VX_201-update-signed.apk" ]]; then
+              echo "- Update APK: signed with repository VX secrets"
+            else
+              echo "- Update APK: not produced; exact existing VX key was not supplied"
+            fi
+            echo "- Release APK: unsigned and requires signing before installation"
+            echo
+            echo "APK identities:"
+            for apk in "$OUTPUT"/*.apk; do
+              echo "--- $(basename "$apk") ---"
+              "$AAPT" dump badging "$apk" | sed -n '1,8p'
+              stat --printf='Size: %s bytes\n' "$apk"
+              sha256sum "$apk"
+            done
+            echo
+            echo "Packaged diagnostic payload:"
+            unzip -Z1 "$OUTPUT/VX_201-debug-signed.apk" \
+              | grep -E '^(assets/diagnostic/|lib/arm64-v8a/libvx(nativeprobe|diagnostic)\.so$)' \
+              | sort
+            echo
+            echo "IMPORTANT: An Android update requires both package com.vx.runtime and the exact same signing certificate as the installed VX application."
+          } | tee "$OUTPUT/VX_201_BUILD_REPORT.txt"
+
+          {
+            echo "# VX 201 verified artifacts"
+            echo
+            echo "- **VX_201-debug-signed.apk**: installable debug build. It updates an installed VX only when the installed app uses the same debug certificate."
+            echo "- **VX_201-release-unsigned.apk**: unsigned release output. Do not attempt installation before signing."
+            if [[ -f "$OUTPUT/VX_201-update-signed.apk" ]]; then
+              echo "- **VX_201-update-signed.apk**: release signed using the key supplied through GitHub Secrets."
+            fi
+            echo "- SHA-256 files and signature reports are included for verification."
+          } > "$OUTPUT/README.md"
+
+          echo "OUTPUT_DIR=$OUTPUT" >> "$GITHUB_ENV"
+          find "$OUTPUT" -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
+
+      - name: Upload VX 201 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VX-201-unified-final-${{ github.run_number }}
+          path: ${{ env.OUTPUT_DIR }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
