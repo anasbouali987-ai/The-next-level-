@@ -1,0 +1,485 @@
+name: Build GTAV Runtime Manager v1.4.1 APK
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+          cache-disabled: true
+
+      - name: Locate and extract source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="$RUNNER_TEMP/gtav-runtime-manager-v141"
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+
+          SETTINGS_FILE="$(find "$GITHUB_WORKSPACE" \
+            -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -not -path "*/.git/*" \
+            -not -path "*/build/*" \
+            | head -n 1 || true)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            SOURCE_ZIP="$(find "$GITHUB_WORKSPACE" \
+              -maxdepth 5 \
+              -type f \
+              \( -iname "*v1.4.1*.zip" -o -iname "*Advanced*Combined*Source*.zip" \) \
+              | head -n 1 || true)"
+
+            if [ -z "$SOURCE_ZIP" ]; then
+              SOURCE_ZIP="$(find "$GITHUB_WORKSPACE" \
+                -maxdepth 5 \
+                -type f \
+                -iname "*.zip" \
+                | head -n 1 || true)"
+            fi
+
+            test -n "$SOURCE_ZIP"
+            unzip -q "$SOURCE_ZIP" -d "$WORK_DIR"
+
+            SETTINGS_FILE="$(find "$WORK_DIR" \
+              -type f \
+              \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+              | head -n 1 || true)"
+          fi
+
+          test -n "$SETTINGS_FILE"
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          test -d "$PROJECT_DIR/app/src/main"
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Apply v1.4.1 source corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          JAVA_DIR="$PROJECT_DIR/app/src/main/java/com/gtav/runtimemanager"
+          test -d "$JAVA_DIR"
+
+          cat > "$JAVA_DIR/RuntimeInstallJournal.java" <<'JAVA'
+          package com.gtav.runtimemanager;
+
+          import android.content.Context;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedWriter;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStreamWriter;
+          import java.nio.charset.StandardCharsets;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          final class RuntimeInstallJournal {
+              private final Context appContext;
+              private final File file;
+
+              RuntimeInstallJournal(Context context) {
+                  appContext = context.getApplicationContext();
+                  file = new File(
+                          RuntimeLogWriter.reportsDir(appContext),
+                          "install_journal.jsonl"
+                  );
+              }
+
+              synchronized void append(InstallSnapshot snapshot, String event) {
+                  if (snapshot == null) return;
+
+                  try {
+                      JSONObject row = new JSONObject();
+                      row.put(
+                              "time",
+                              new SimpleDateFormat(
+                                      "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+                                      Locale.US
+                              ).format(new Date())
+                      );
+                      row.put("event", event == null ? "progress" : event);
+                      row.put("stage", snapshot.stage.name());
+                      row.put("running", snapshot.running);
+                      row.put("done", snapshot.done);
+                      row.put("total", snapshot.total);
+                      row.put("compressed_done", snapshot.compressedDone);
+                      row.put("written_bytes", snapshot.writtenBytes);
+                      row.put("current_file", snapshot.currentFile);
+                      row.put("message", snapshot.message);
+                      row.put(
+                              "error_code",
+                              snapshot.errorCode == null
+                                      ? ""
+                                      : snapshot.errorCode.name()
+                      );
+                      row.put("files", snapshot.stats.files);
+                      row.put("directories", snapshot.stats.directories);
+                      row.put("symlinks", snapshot.stats.symlinks);
+                      row.put("hardlinks", snapshot.stats.hardLinks);
+                      row.put("memory_free", snapshot.memory.freeBytes);
+                      row.put("memory_used", snapshot.memory.usedBytes);
+                      row.put("memory_max", snapshot.memory.maxBytes);
+
+                      try (BufferedWriter writer = new BufferedWriter(
+                              new OutputStreamWriter(
+                                      new FileOutputStream(file, true),
+                                      StandardCharsets.UTF_8
+                              ),
+                              16 * 1024
+                      )) {
+                          writer.write(row.toString());
+                          writer.newLine();
+                          writer.flush();
+                      }
+                  } catch (Throwable error) {
+                      RuntimeCrashReporter.record(
+                              appContext,
+                              "journal-write",
+                              error,
+                              snapshot
+                      );
+                  }
+              }
+
+              File file() {
+                  return file;
+              }
+          }
+          JAVA
+
+          cat > "$JAVA_DIR/RuntimeInstallWatchdog.java" <<'JAVA'
+          package com.gtav.runtimemanager;
+
+          import android.content.Context;
+          import android.os.SystemClock;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.ScheduledExecutorService;
+          import java.util.concurrent.TimeUnit;
+          import java.util.concurrent.atomic.AtomicBoolean;
+
+          final class RuntimeInstallWatchdog implements AutoCloseable {
+              private final Context appContext;
+              private final ScheduledExecutorService scheduler;
+              private final AtomicBoolean closed = new AtomicBoolean(false);
+
+              private volatile long lastProgressAt =
+                      SystemClock.elapsedRealtime();
+              private volatile long lastDone;
+              private volatile InstallSnapshot lastSnapshot =
+                      InstallSnapshot.idle();
+
+              RuntimeInstallWatchdog(Context context) {
+                  appContext = context.getApplicationContext();
+
+                  scheduler = Executors.newSingleThreadScheduledExecutor(
+                          runnable -> new Thread(
+                                  runnable,
+                                  "gtav-install-watchdog"
+                          )
+                  );
+
+                  scheduler.scheduleAtFixedRate(
+                          this::check,
+                          30,
+                          30,
+                          TimeUnit.SECONDS
+                  );
+              }
+
+              void observe(InstallSnapshot snapshot) {
+                  if (snapshot == null) return;
+
+                  InstallStage previousStage = lastSnapshot.stage;
+                  lastSnapshot = snapshot;
+
+                  if (snapshot.done != lastDone
+                          || snapshot.stage != previousStage) {
+                      lastDone = snapshot.done;
+                      lastProgressAt = SystemClock.elapsedRealtime();
+                  }
+              }
+
+              private void check() {
+                  if (closed.get()) return;
+
+                  InstallSnapshot snapshot = lastSnapshot;
+
+                  if (snapshot == null || !snapshot.running) return;
+
+                  long stalledMs =
+                          SystemClock.elapsedRealtime() - lastProgressAt;
+
+                  if (stalledMs < 90_000L) return;
+
+                  try {
+                      File report = new File(
+                              RuntimeLogWriter.reportsDir(appContext),
+                              "watchdog_report.txt"
+                      );
+
+                      MemorySnapshot memory = MemorySnapshot.capture();
+
+                      String text =
+                              "GTAV Runtime Install Watchdog\n"
+                                      + "================================\n"
+                                      + "Stage: " + snapshot.stage.name() + "\n"
+                                      + "Current file: " + snapshot.currentFile + "\n"
+                                      + "Done: " + snapshot.done + "\n"
+                                      + "Total: " + snapshot.total + "\n"
+                                      + "Written bytes: " + snapshot.writtenBytes + "\n"
+                                      + "Stalled ms: " + stalledMs + "\n"
+                                      + "Memory free: " + memory.freeBytes + "\n"
+                                      + "Memory used: " + memory.usedBytes + "\n"
+                                      + "Memory max: " + memory.maxBytes + "\n";
+
+                      try (FileOutputStream output =
+                                   new FileOutputStream(report, false)) {
+                          output.write(
+                                  text.getBytes(StandardCharsets.UTF_8)
+                          );
+                          output.getFD().sync();
+                      }
+
+                      lastProgressAt = SystemClock.elapsedRealtime();
+                  } catch (Throwable error) {
+                      RuntimeCrashReporter.record(
+                              appContext,
+                              "watchdog",
+                              error,
+                              snapshot
+                      );
+                  }
+              }
+
+              @Override
+              public void close() {
+                  if (closed.compareAndSet(false, true)) {
+                      scheduler.shutdownNow();
+                  }
+              }
+          }
+          JAVA
+
+          cat > "$JAVA_DIR/RuntimeRecoveryManager.java" <<'JAVA'
+          package com.gtav.runtimemanager;
+
+          import android.content.Context;
+
+          import java.io.File;
+
+          final class RuntimeRecoveryManager {
+              private RuntimeRecoveryManager() {
+              }
+
+              static void recover(Context context) {
+                  Context appContext = context.getApplicationContext();
+                  File root = StorageLocations.runtimesRoot(appContext);
+                  File[] children = root.listFiles();
+
+                  if (children == null) return;
+
+                  try (RuntimeLogWriter log =
+                               new RuntimeLogWriter(
+                                       appContext,
+                                       "startup-recovery"
+                               )) {
+                      for (File child : children) {
+                          String name = child.getName();
+
+                          if (name.endsWith(".backup")) {
+                              String runtimeName = name.substring(
+                                      0,
+                                      name.length() - ".backup".length()
+                              );
+
+                              File target = new File(root, runtimeName);
+
+                              if (!target.exists()) {
+                                  if (child.renameTo(target)) {
+                                      log.log(
+                                              "RESTORED_BACKUP "
+                                                      + target.getName()
+                                      );
+                                  } else {
+                                      log.log(
+                                              "FAILED_RESTORE_BACKUP "
+                                                      + child.getAbsolutePath()
+                                      );
+                                  }
+                              }
+                          } else if (name.endsWith(".installing")) {
+                              log.log(
+                                      "FOUND_INTERRUPTED_INSTALL "
+                                              + child.getAbsolutePath()
+                              );
+                          }
+                      }
+                  } catch (Throwable error) {
+                      RuntimeCrashReporter.record(
+                              appContext,
+                              "startup-recovery",
+                              error,
+                              InstallSnapshot.idle()
+                      );
+                  }
+              }
+          }
+          JAVA
+
+          python3 - "$JAVA_DIR" <<'PY'
+          from pathlib import Path
+          import sys
+
+          java_dir = Path(sys.argv[1])
+
+          for java_file in java_dir.glob("*.java"):
+              text = java_file.read_text(encoding="utf-8")
+              text = text.replace("\ufeff", "")
+              java_file.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Configure Java compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_GRADLE="$PROJECT_DIR/app/build.gradle.kts"
+
+          if [ -f "$APP_GRADLE" ] \
+             && ! grep -q 'tasks.withType<JavaCompile>()' "$APP_GRADLE"; then
+            cat >> "$APP_GRADLE" <<'KTS'
+
+          tasks.withType<JavaCompile>().configureEach {
+              options.encoding = "UTF-8"
+          }
+          KTS
+          fi
+
+      - name: Validate Gradle project
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            projects
+
+      - name: Build debug APK
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            --warning-mode all \
+            clean :app:assembleDebug \
+            2>&1 | tee "$GITHUB_WORKSPACE/gradle-build-full.log"
+
+      - name: Collect and validate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FILE="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f \
+            -name "*.apk" \
+            | head -n 1 || true)"
+
+          test -n "$APK_FILE"
+          test -f "$APK_FILE"
+
+          OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          FINAL_APK="$OUTPUT_DIR/GTAV-Runtime-Manager-v1.4.1-debug.apk"
+          cp "$APK_FILE" "$FINAL_APK"
+
+          unzip -Z1 "$FINAL_APK" \
+            | sort \
+            > "$OUTPUT_DIR/apk-contents.txt"
+
+          sha256sum "$FINAL_APK" \
+            > "$OUTPUT_DIR/SHA256SUMS.txt"
+
+          if ! grep -Eq \
+            '^lib/arm64-v8a/.*zstd.*\.so$' \
+            "$OUTPUT_DIR/apk-contents.txt"; then
+            echo "::error::arm64-v8a Zstandard library is missing."
+            exit 1
+          fi
+
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTAV-Runtime-Manager-v1.4.1-APK
+          path: ${{ steps.apk.outputs.output_dir }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload complete build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTAV-Runtime-Manager-v1.4.1-Build-Diagnostics
+          path: |
+            gradle-build-full.log
+            **/app/build/reports/**
+            **/app/build/test-results/**
+            **/app/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
