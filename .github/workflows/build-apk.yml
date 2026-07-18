@@ -1,11 +1,11 @@
-name: Build GTAV Runtime Manager v1.7 Experiment 4 — FIXED v3
-run-name: GTAV v1.7 Exp4 — fixed-v3 — ${{ github.ref_name }}
+name: Build GTAV Runtime Manager v1.7 Experiment 4 — FIXED v4
+run-name: GTAV v1.7 Exp4 — fixed-v4 — ${{ github.ref_name }}
 
 "on":
   workflow_dispatch:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -18,83 +18,141 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
-      WORKFLOW_REVISION: fixed-v3-no-source-integrity
-      SOURCE_ARCHIVE: GTAV_Runtime_Manager_v1.7.0_Execution_Foundation_Experiment4_Comprehensive_Source_CORRECTED.zip
-      # Optional repository variable. When absent, a tested full commit SHA is used.
-      TERMUX_PACKAGES_REF: ${{ vars.TERMUX_PACKAGES_COMMIT }}
+      WORKFLOW_REVISION: fixed-v4-canonical-termux-paths
+      SOURCE_ARCHIVE: GTAV_Runtime_Manager_v1.7.0_Execution_Foundation_Experiment4_Comprehensive_Source_FIXED_V4.zip
+      PROJECT_DIR: extracted-source/GTAV_Runtime_Manager_v1.7.0_Execution_Foundation_Experiment4_Comprehensive
+      TERMUX_PACKAGES_REF_INPUT: ${{ vars.TERMUX_PACKAGES_COMMIT }}
       DEFAULT_TERMUX_PACKAGES_REF: 17c04d8e63e4744a91590854cac9ee44f143e5e2
-      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+      EXPECTED_PROOT_VERSION: 5.1.107.84
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-      - name: Confirm fixed workflow revision
+      - name: Confirm workflow revision and prepare diagnostics
         shell: bash
         run: |
           set -euo pipefail
-          echo "WORKFLOW_REVISION=$WORKFLOW_REVISION"
-          workflow=.github/workflows/build-apk.yml
-          [[ -f "$workflow" ]] || {
-            echo "ERROR: $workflow is missing. Replace the workflow at this exact path." >&2
-            exit 1
-          }
-          grep -Fq 'WORKFLOW_REVISION: fixed-v3-no-source-integrity' "$workflow" || {
-            echo 'ERROR: GitHub checked out an old or differently named workflow.' >&2
-            exit 1
-          }
-          if grep -Fq -- '- name: Source integrity' "$workflow"; then
-            echo 'ERROR: obsolete Source integrity step is still present.' >&2
-            exit 1
-          fi
-          echo 'FIXED_WORKFLOW_CONFIRMED'
+          [[ "$WORKFLOW_REVISION" == "fixed-v4-canonical-termux-paths" ]]
+          mkdir -p artifacts/reports/system apk-inspection
+          : > gradle-build.log
+          : > execution-components-build.log
+          printf '%s\n' "$WORKFLOW_REVISION" > artifacts/reports/WORKFLOW_REVISION.txt
+          echo 'FIXED_WORKFLOW_V4_CONFIRMED'
 
-      - name: Locate Android project
+      - name: Locate exact corrected source archive
         shell: bash
         run: |
           set -euo pipefail
-          project="$(find . -maxdepth 4 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | sort | head -n 1 || true)"
-
-          if [[ -z "$project" ]]; then
-            zip="./$SOURCE_ARCHIVE"
-            [[ -f "$zip" ]] || {
-              echo "ERROR: required source archive not found: $SOURCE_ARCHIVE" >&2
-              echo 'Delete old Runtime/Source ZIP files and upload the corrected archive with the exact name above.' >&2
-              echo 'ZIP files currently present:' >&2
-              find . -maxdepth 2 -type f -iname '*.zip' -print >&2 || true
-              exit 1
-            }
-            rm -rf extracted-source
-            mkdir -p extracted-source
-            unzip -q "$zip" -d extracted-source
-            project="$(find extracted-source -maxdepth 5 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | sort | head -n 1 || true)"
-          fi
-
-          [[ -n "$project" ]] || { echo 'ERROR: settings.gradle(.kts) not found'; exit 1; }
-          project="${project#./}"
-          [[ -f "$project/tools/provision-execution-components.sh" ]] || {
-            echo 'ERROR: provision-execution-components.sh is missing from selected source.' >&2
+          archive="$GITHUB_WORKSPACE/$SOURCE_ARCHIVE"
+          [[ -f "$archive" ]] || {
+            echo "ERROR: required source archive is missing: $SOURCE_ARCHIVE" >&2
+            echo 'ZIP files found in repository root:' >&2
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' >&2 || true
             exit 1
           }
-          echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
-          echo "Project: $project"
 
-      - name: Validate corrected source revision
+          unsafe_entries="$(unzip -Z1 "$archive" | grep -E '(^/|(^|/)\.\.(/|$))' || true)"
+          [[ -z "$unsafe_entries" ]] || {
+            echo 'ERROR: source archive contains unsafe paths:' >&2
+            printf '%s\n' "$unsafe_entries" >&2
+            exit 1
+          }
+
+          rm -rf "$GITHUB_WORKSPACE/extracted-source"
+          mkdir -p "$GITHUB_WORKSPACE/extracted-source"
+          unzip -q "$archive" -d "$GITHUB_WORKSPACE/extracted-source"
+
+          mapfile -t projects < <(
+            find "$GITHUB_WORKSPACE/extracted-source" -maxdepth 6 -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -printf '%h\n' | sort -u
+          )
+          [[ "${#projects[@]}" -eq 1 ]] || {
+            echo "ERROR: expected exactly one Android project; found ${#projects[@]}." >&2
+            printf '%s\n' "${projects[@]:-}" >&2
+            exit 1
+          }
+
+          expected_project="$GITHUB_WORKSPACE/$PROJECT_DIR"
+          [[ "$(realpath "${projects[0]}")" == "$(realpath "$expected_project")" ]] || {
+            echo "ERROR: archive project directory does not match $PROJECT_DIR." >&2
+            exit 1
+          }
+          [[ -f "$expected_project/tools/provision-execution-components.sh" ]] || {
+            echo 'ERROR: provisioning script is missing from corrected source.' >&2
+            exit 1
+          }
+          echo "PROJECT_DIR=$PROJECT_DIR"
+          echo 'CORRECTED_SOURCE_ARCHIVE_SELECTED'
+
+      - name: Install host validation and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            ca-certificates \
+            curl \
+            dpkg-dev \
+            file \
+            g++ \
+            gcc \
+            gcc-x86-64-linux-gnu \
+            git \
+            jq \
+            python3 \
+            tar \
+            unzip \
+            xz-utils \
+            zip
+
+      - name: Validate corrected source revision and patch regression tests
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          bash -n tools/provision-execution-components.sh
-          grep -Fq 'TERMUX_PROPERTIES_EVALUATION_INCOMPLETE' tools/provision-execution-components.sh || {
-            echo 'ERROR: the selected source archive contains the old PRoot provisioning script.' >&2
-            echo 'Upload the corrected source archive supplied with this workflow.' >&2
-            exit 1
-          }
-          echo 'CORRECTED_SOURCE_CONFIRMED'
+          grep -Fqx 'PROVISION_SCRIPT_REVISION="fixed-v4-canonical-termux-paths"' \
+            tools/provision-execution-components.sh || {
+              echo 'ERROR: selected source does not contain the fixed-v4 provisioning revision.' >&2
+              exit 1
+            }
 
-      - name: Source and architecture checks
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find . -type f -name '*.sh' -print0)
+
+          PYTHONDONTWRITEBYTECODE=1 python3 -B - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          python_files = [
+              Path('tools/patch_termux_properties.py'),
+              Path('tools/test_termux_properties_patch.py'),
+          ]
+          for python_file in python_files:
+              compile(python_file.read_text(), str(python_file), 'exec')
+
+          xml_files = list(Path('app/src').rglob('*.xml'))
+          for xml_file in xml_files:
+              ET.parse(xml_file)
+          print(f'PYTHON_OK files={len(python_files)}')
+          print(f'XML_OK files={len(xml_files)}')
+          PY
+          (cd tools && PYTHONDONTWRITEBYTECODE=1 python3 -B test_termux_properties_patch.py)
+
+          sha256sum --check --strict execution-components/HELLO_X86_64_SHA256.txt
+          readelf -h app/src/main/assets/execution/hello-x86_64 | \
+            grep -q 'Advanced Micro Devices X86-64'
+          echo 'CORRECTED_SOURCE_V4_CONFIRMED'
+
+      - name: Source and execution architecture checks
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -103,10 +161,11 @@ jobs:
           bash tools/verify-execution-architecture.sh
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+          check-latest: false
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -117,46 +176,41 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK and host build tools
+      - name: Install required Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;35.0.0'
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc g++ gcc-x86-64-linux-gnu binutils dpkg-dev curl unzip zip file jq
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;35.0.0'
 
-      - name: Resolve Termux packages source revision
+      - name: Resolve pinned Termux source revision
+        id: termux
         shell: bash
         run: |
           set -euo pipefail
-
-          ref="${TERMUX_PACKAGES_REF:-$DEFAULT_TERMUX_PACKAGES_REF}"
+          ref="${TERMUX_PACKAGES_REF_INPUT:-$DEFAULT_TERMUX_PACKAGES_REF}"
           [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'TERMUX_PACKAGES_COMMIT must be a full 40-character commit SHA.' >&2
+            echo 'ERROR: TERMUX_PACKAGES_COMMIT must be a full 40-character commit SHA.' >&2
             exit 1
           }
-
-          proot_build="$(curl --fail --silent --show-error --location \n            --retry 4 --retry-delay 2 \n            "https://raw.githubusercontent.com/termux/termux-packages/${ref}/packages/proot/build.sh")"
-          proot_version="$(printf '%s\n' "$proot_build" \n            | sed -n 's/^TERMUX_PKG_VERSION="\?\([^" ]*\)"\?$/\1/p' \n            | head -n 1)"
-          [[ -n "$proot_version" ]] || {
-            echo "Unable to determine the PRoot package version at $ref." >&2
-            exit 1
-          }
-
+          script_sha="$(sha256sum "$PROJECT_DIR/tools/provision-execution-components.sh" | awk '{print $1}')"
           echo "TERMUX_PACKAGES_REF=$ref" >> "$GITHUB_ENV"
-          echo "EXPECTED_PROOT_VERSION=$proot_version" >> "$GITHUB_ENV"
-          echo "Using pinned termux-packages commit: $ref"
-          echo "Using PRoot package version: $proot_version"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "script_sha=$script_sha" >> "$GITHUB_OUTPUT"
+          echo "Pinned termux-packages commit: $ref"
+          echo "Expected PRoot version: $EXPECTED_PROOT_VERSION"
+          echo "Provision script SHA-256: $script_sha"
 
       - name: Cache custom-prefix PRoot build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ${{ env.PROJECT_DIR }}/.termux-packages/.termux-build
             ${{ env.PROJECT_DIR }}/.termux-packages/output
-          key: proot-${{ runner.os }}-${{ env.TERMUX_PACKAGES_REF }}-${{ hashFiles(format('{0}/tools/provision-execution-components.sh', env.PROJECT_DIR)) }}
+          key: proot-${{ runner.os }}-${{ steps.termux.outputs.ref }}-${{ steps.termux.outputs.script_sha }}
 
       - name: Provision Android ARM64 PRoot and x86_64 smoke ELF
         working-directory: ${{ env.PROJECT_DIR }}
@@ -166,16 +220,14 @@ jobs:
           PROOT_COMPONENT_BUNDLE_SHA256: ${{ secrets.PROOT_COMPONENT_BUNDLE_SHA256 }}
         run: |
           set -euo pipefail
-          bash tools/provision-execution-components.sh | tee "$GITHUB_WORKSPACE/execution-components-build.log"
-          echo '--- PRoot ELF ---'
+          set -o pipefail
+          bash tools/provision-execution-components.sh 2>&1 | \
+            tee "$GITHUB_WORKSPACE/execution-components-build.log"
           readelf -h app/src/main/assets/execution/usr/bin/proot
-          echo '--- PRoot loader ELF ---'
           readelf -h app/src/main/assets/execution/usr/libexec/proot/loader
-          echo '--- x86_64 smoke ELF ---'
           readelf -h app/src/main/assets/execution/hello-x86_64
 
-      - name: Build, test, lint, and validate Debug + Release
-        id: gradle_build
+      - name: Build, test, lint, and validate Debug and Release
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -190,8 +242,6 @@ jobs:
           "${GRADLE[@]}" --no-daemon --stacktrace \
             testDebugUnitTest \
             lintDebug \
-            assembleDebug \
-            assembleRelease \
             assembleDebugAndroidTest \
             validateAllNativePackaging \
             2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
@@ -205,11 +255,15 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/apk-inspection"
           while IFS= read -r -d '' apk; do
             base="$(basename "$apk")"
-            unzip -l "$apk" | tee "$GITHUB_WORKSPACE/apk-inspection/${base}.txt"
-            echo "--- assets/execution in $base ---"
-            unzip -l "$apk" | grep -E 'assets/execution/(usr/bin/proot|usr/libexec/proot/loader|hello-x86_64)' || true
-            echo "--- lib/arm64-v8a in $base ---"
-            unzip -l "$apk" | grep 'lib/arm64-v8a/' || true
+            unzip -tq "$apk"
+            unzip -l "$apk" > "$GITHUB_WORKSPACE/apk-inspection/${base}.txt"
+            {
+              echo "--- assets/execution in $base ---"
+              unzip -l "$apk" | grep -E \
+                'assets/execution/(usr/bin/proot|usr/libexec/proot/loader|hello-x86_64)' || true
+              echo "--- lib/arm64-v8a in $base ---"
+              unzip -l "$apk" | grep 'lib/arm64-v8a/' || true
+            } | tee "$GITHUB_WORKSPACE/apk-inspection/${base}.summary.txt"
           done < <(find app/build/outputs/apk -type f -name '*.apk' -print0 2>/dev/null || true)
 
       - name: Collect APKs and build reports
@@ -220,49 +274,79 @@ jobs:
           set -euo pipefail
           OUT="$GITHUB_WORKSPACE/artifacts"
           mkdir -p "$OUT/reports"
-          debug="$(find app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
-          release="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
-          android_test="$(find app/build/outputs/apk/androidTest -type f -name '*.apk' | head -n 1 || true)"
+
+          debug="$(find app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
+          release="$(find app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
+          android_test="$(find app/build/outputs/apk/androidTest -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+          [[ -n "$debug" && -n "$release" ]] || {
+            echo 'ERROR: expected Debug and Release APKs were not produced.' >&2
+            exit 1
+          }
+
           cp "$debug" "$OUT/GTAV-Runtime-Manager-v1.7.0-exp4-debug.apk"
           cp "$release" "$OUT/GTAV-Runtime-Manager-v1.7.0-exp4-release-unsigned.apk"
-          [[ -z "$android_test" ]] || cp "$android_test" "$OUT/GTAV-Runtime-Manager-v1.7.0-exp4-androidTest.apk"
+          [[ -z "$android_test" ]] || \
+            cp "$android_test" "$OUT/GTAV-Runtime-Manager-v1.7.0-exp4-androidTest.apk"
+
           cp -a app/build/reports/native-packaging "$OUT/reports/" 2>/dev/null || true
           cp -a app/build/reports/execution-components "$OUT/reports/" 2>/dev/null || true
           cp -a execution-components/reports "$OUT/reports/provisioning" 2>/dev/null || true
           cp "$GITHUB_WORKSPACE/gradle-build.log" "$OUT/reports/"
           cp "$GITHUB_WORKSPACE/execution-components-build.log" "$OUT/reports/"
           cp -a "$GITHUB_WORKSPACE/apk-inspection" "$OUT/reports/"
+
           (
             cd "$OUT"
-            sha256sum *.apk > SHA256SUMS.txt
+            sha256sum ./*.apk > SHA256SUMS.txt
           )
+
           {
-            echo "App version: 1.7.0-exp4"
+            echo 'App version: 1.7.0-exp4'
             echo "Commit: $GITHUB_SHA"
             echo "Run: $GITHUB_RUN_ID"
-            echo "Requested ABI: arm64-v8a"
-            echo "Variants: Debug, Release, androidTest"
-            echo "Execution gates: PRoot, RootFS, Box64, Wine Console"
-            echo "Future backends: Display/Audio/Graphics/Input NOT_IMPLEMENTED"
+            echo 'Requested ABI: arm64-v8a'
+            echo 'Variants: Debug, Release, androidTest'
+            echo 'Execution gates: PRoot, RootFS, Box64, Wine Console'
+            echo 'Future backends: Display/Audio/Graphics/Input NOT_IMPLEMENTED'
             echo
             find "$OUT/reports" -type f -printf '%P\n' | sort
           } > "$OUT/BUILD_INFO.txt"
-          cat execution-components/reports/EXECUTION_COMPONENTS.txt > "$OUT/EXECUTION_COMPONENTS.txt"
-          cat > "$OUT/FEATURE_FLAGS.txt" <<'EOF'
-          PROOT=REQUESTED
-          BOX64=REQUESTED
-          WINE=REQUESTED
-          DISPLAY=NOT_REQUESTED
-          AUDIO=NOT_REQUESTED
-          GRAPHICS=NOT_REQUESTED
-          DXVK=NOT_REQUESTED
-          INPUT=NOT_REQUESTED
-          GAME_LIBRARY=NOT_REQUESTED
-          EOF
+
+          cp execution-components/reports/EXECUTION_COMPONENTS.txt \
+            "$OUT/EXECUTION_COMPONENTS.txt"
+          printf '%s\n' \
+            'PROOT=REQUESTED' \
+            'BOX64=REQUESTED' \
+            'WINE=REQUESTED' \
+            'DISPLAY=NOT_REQUESTED' \
+            'AUDIO=NOT_REQUESTED' \
+            'GRAPHICS=NOT_REQUESTED' \
+            'DXVK=NOT_REQUESTED' \
+            'INPUT=NOT_REQUESTED' \
+            'GAME_LIBRARY=NOT_REQUESTED' \
+            > "$OUT/FEATURE_FLAGS.txt"
+
+      - name: Collect system diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="$GITHUB_WORKSPACE/artifacts/reports/system"
+          mkdir -p "$REPORT"
+          df -h > "$REPORT/disk-space.txt"
+          docker version > "$REPORT/docker-version.txt" 2>&1 || true
+          java -version > "$REPORT/java-version.txt" 2>&1 || true
+          gradle --version > "$REPORT/gradle-version.txt" 2>&1 || true
+          sdkmanager --version > "$REPORT/sdkmanager-version.txt" 2>&1 || true
+          git --version > "$REPORT/git-version.txt" 2>&1 || true
+          if [[ -n "${PROJECT_DIR:-}" && -d "$PROJECT_DIR" ]]; then
+            find "$PROJECT_DIR" -maxdepth 3 -type f -printf '%P\n' | sort \
+              > "$REPORT/project-file-list.txt"
+          fi
 
       - name: Upload installable Debug APK
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GTAV-Runtime-Manager-v1.7.0-Experiment4-Installable
           path: |
@@ -271,24 +355,26 @@ jobs:
             artifacts/BUILD_INFO.txt
             artifacts/EXECUTION_COMPONENTS.txt
             artifacts/FEATURE_FLAGS.txt
+          if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
       - name: Upload Release and test APKs
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GTAV-Runtime-Manager-v1.7.0-Experiment4-Release-and-Tests
           path: |
             artifacts/GTAV-Runtime-Manager-v1.7.0-exp4-release-unsigned.apk
             artifacts/GTAV-Runtime-Manager-v1.7.0-exp4-androidTest.apk
             artifacts/SHA256SUMS.txt
+          if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
       - name: Upload validation reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GTAV-Runtime-Manager-v1.7.0-Experiment4-Build-Reports
           path: |
@@ -296,6 +382,6 @@ jobs:
             gradle-build.log
             execution-components-build.log
             apk-inspection
-          if-no-files-found: warn
+          if-no-files-found: error
           compression-level: 0
           retention-days: 30
